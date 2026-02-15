@@ -11,11 +11,13 @@ on:
           - patch
           - minor
           - major
-      dev:
-        description: 'Dev build (no optimizations, devtools enabled, fast)'
-        required: false
-        type: boolean
-        default: false
+      mode:
+        description: 'Build mode'
+        required: true
+        type: choice
+        options:
+          - production
+          - dev
 
 jobs:
   bump-version:
@@ -41,7 +43,7 @@ jobs:
           esac
 
           VERSION="$MAJOR.$MINOR.$PATCH"
-          SUFFIX="${{ inputs.dev == true && '-dev' || '' }}"
+          SUFFIX="${{ inputs.mode == 'dev' && '-dev' || '' }}"
           TAG="v${VERSION}${SUFFIX}"
 
           echo "📦 $CURRENT → $VERSION (${{ inputs.bump }})"
@@ -115,7 +117,7 @@ jobs:
         run: npm ci
 
       - name: Set dev build env vars
-        if: inputs.dev == true
+        if: inputs.mode == 'dev'
         shell: bash
         run: |
           echo "CARGO_PROFILE_RELEASE_OPT_LEVEL=0" >> $GITHUB_ENV
@@ -132,10 +134,10 @@ jobs:
         with:
           tagName: ${{ needs.bump-version.outputs.tag }}
           releaseName: "MyWallpaper Desktop ${{ needs.bump-version.outputs.tag }}"
-          releaseBody: "See the assets to download this version and install.${{ inputs.dev == true && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}"
+          releaseBody: "See the assets to download this version and install.${{ inputs.mode == 'dev' && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}"
           releaseDraft: true
-          prerelease: ${{ inputs.dev == true }}
-          args: ${{ matrix.args }} ${{ inputs.dev == true && '--features devtools' || '' }}
+          prerelease: ${{ inputs.mode == 'dev' }}
+          args: ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
 
   publish-release:
     needs: [bump-version, publish-tauri]
