@@ -222,34 +222,57 @@ pub fn main() {
                 // Show the window after positioning
                 let _ = window.show();
 
-                // On Linux/X11: set window type to DESKTOP so it sits above
-                // the wallpaper but below all application windows.
+                // On Linux/X11: place window below all others so it acts as
+                // a wallpaper layer above the real desktop but below all apps.
+                //
+                // Previous approach used _NET_WM_WINDOW_TYPE_DESKTOP + name-based
+                // xdotool search. This caused two problems:
+                // 1. `xdotool search --name MyWallpaper` is a substring match that
+                //    also hits terminals, editors, and browsers whose title contains
+                //    "MyWallpaper", setting THEM as desktop windows too.
+                // 2. DESKTOP type triggers WM side effects (click interception,
+                //    show-desktop toggle, stacking interference with other windows).
+                //
+                // Fix: use PID-based matching + _NET_WM_STATE_BELOW which simply
+                // keeps our window below normal windows without DESKTOP semantics.
                 #[cfg(target_os = "linux")]
                 {
-                    let window_title = "MyWallpaper".to_string();
+                    let pid = std::process::id();
                     std::thread::spawn(move || {
                         // Wait for the window to be registered with X11
                         std::thread::sleep(std::time::Duration::from_millis(800));
 
-                        if let Ok(output) = std::process::Command::new("xdotool")
-                            .args(["search", "--name", &window_title])
+                        // Match by PID only — never by name (substring match is dangerous)
+                        let Ok(output) = std::process::Command::new("xdotool")
+                            .args(["search", "--pid", &pid.to_string()])
                             .output()
-                        {
-                            let wids = String::from_utf8_lossy(&output.stdout);
-                            for wid in wids.trim().lines() {
-                                if wid.is_empty() { continue; }
-                                info!("Setting X11 window {} as DESKTOP type", wid);
-                                let _ = std::process::Command::new("xprop")
-                                    .args([
-                                        "-id", wid,
-                                        "-f", "_NET_WM_WINDOW_TYPE", "32a",
-                                        "-set", "_NET_WM_WINDOW_TYPE",
-                                        "_NET_WM_WINDOW_TYPE_DESKTOP",
-                                    ])
-                                    .output();
-                            }
-                        } else {
-                            warn!("xdotool not found — cannot set desktop window type");
+                        else {
+                            warn!("xdotool not found — cannot configure wallpaper layer");
+                            return;
+                        };
+
+                        let wids = String::from_utf8_lossy(&output.stdout);
+                        for wid in wids.trim().lines() {
+                            if wid.is_empty() { continue; }
+                            info!("Configuring X11 window {} as wallpaper layer", wid);
+
+                            // Set _NET_WM_STATE: below + sticky + skip taskbar/pager
+                            // This keeps our window below all normal windows without
+                            // the side effects of _NET_WM_WINDOW_TYPE_DESKTOP.
+                            let _ = std::process::Command::new("xprop")
+                                .args([
+                                    "-id", wid,
+                                    "-f", "_NET_WM_STATE", "32a",
+                                    "-set", "_NET_WM_STATE",
+                                    "_NET_WM_STATE_BELOW, _NET_WM_STATE_STICKY, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER",
+                                ])
+                                .output();
+
+                            // Also lower the window immediately as a fallback
+                            // in case the WM doesn't pick up the property change
+                            let _ = std::process::Command::new("xdotool")
+                                .args(["windowlower", wid])
+                                .output();
                         }
                     });
                 }
