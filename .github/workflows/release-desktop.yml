@@ -1,4 +1,5 @@
 name: Desktop Release
+run-name: "Release ${{ inputs.bump }} (${{ inputs.mode }})"
 
 on:
   workflow_dispatch:
