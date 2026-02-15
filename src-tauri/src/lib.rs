@@ -91,7 +91,31 @@ pub fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin({
+            let mut updater = tauri_plugin_updater::Builder::new();
+
+            // On Linux, detect installation method and set the correct updater target.
+            // Default "linux-x86_64" maps to AppImage.tar.gz, but deb/rpm installs
+            // need their specific target to download the correct package format.
+            #[cfg(target_os = "linux")]
+            {
+                if std::env::var("APPIMAGE").is_err() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        if exe.to_str().map_or(false, |p| p.starts_with("/usr")) {
+                            if std::path::Path::new("/var/lib/dpkg").exists() {
+                                info!("Detected .deb installation, using linux-x86_64-deb updater target");
+                                updater = updater.target("linux-x86_64-deb");
+                            } else if std::path::Path::new("/var/lib/rpm").exists() {
+                                info!("Detected .rpm installation, using linux-x86_64-rpm updater target");
+                                updater = updater.target("linux-x86_64-rpm");
+                            }
+                        }
+                    }
+                }
+            }
+
+            updater.build()
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
