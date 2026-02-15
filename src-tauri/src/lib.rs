@@ -3,11 +3,6 @@
 //! Tauri backend for the MyWallpaper animated wallpaper application.
 //! Provides system tray and auto-updates.
 
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
-
 mod commands;
 mod desktop_clone;
 mod tray;
@@ -262,11 +257,3 @@ pub fn main() {
         .expect("Error while running MyWallpaper Desktop");
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_app_starts() {
-        // Basic smoke test
-        assert!(true);
-    }
-}

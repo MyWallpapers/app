@@ -4,7 +4,7 @@ version = "1.0.9"
 description = "MyWallpaper Desktop - Animated Wallpaper Application"
 authors = ["MyWallpaper Team"]
 license = "MIT"
-repository = "https://github.com/mywallpaper/desktop"
+repository = "https://github.com/MyWallpapers/desktop"
 edition = "2021"
 
 [lib]
@@ -51,8 +51,9 @@ custom-protocol = ["tauri/custom-protocol"]
 devtools = ["tauri/devtools"]
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-opt-level = "s"
+incremental = false

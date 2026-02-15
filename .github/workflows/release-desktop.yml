@@ -16,7 +16,7 @@ on:
         required: true
         type: choice
         options:
-          - production
+          - prod
           - dev
 
 jobs:
@@ -48,13 +48,8 @@ jobs:
 
           echo "📦 $CURRENT → $VERSION (${{ inputs.bump }})"
 
-          # Update tauri.conf.json
           sed -i "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
-
-          # Update Cargo.toml
           sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
-
-          # Update package.json
           sed -i "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" package.json
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -77,13 +72,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest"
+          - platform: macos-latest
             args: "--target aarch64-apple-darwin"
-          - platform: "macos-latest"
+          - platform: macos-latest
             args: "--target x86_64-apple-darwin"
-          - platform: "ubuntu-22.04"
+          - platform: ubuntu-22.04
             args: ""
-          - platform: "windows-latest"
+          - platform: windows-latest
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -116,16 +111,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Set dev build env vars
+      - name: Configure dev build
         if: inputs.mode == 'dev'
         shell: bash
         run: |
           echo "CARGO_PROFILE_RELEASE_OPT_LEVEL=0" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_LTO=false" >> $GITHUB_ENV
-          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_STRIP=none" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
+          echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
 
-      - name: Build and Publish Desktop App
+      - name: Build and publish
         uses: tauri-apps/tauri-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,7 +131,7 @@ jobs:
         with:
           tagName: ${{ needs.bump-version.outputs.tag }}
           releaseName: "MyWallpaper Desktop ${{ needs.bump-version.outputs.tag }}"
-          releaseBody: "See the assets to download this version and install.${{ inputs.mode == 'dev' && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}"
+          releaseBody: "See the assets to download and install.${{ inputs.mode == 'dev' && ' ⚠️ DEV BUILD — unoptimized, devtools enabled.' || '' }}"
           releaseDraft: true
           prerelease: ${{ inputs.mode == 'dev' }}
           args: ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
