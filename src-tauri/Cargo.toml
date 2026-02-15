@@ -4,7 +4,7 @@ version = "1.0.13"
 description = "MyWallpaper Desktop - Animated Wallpaper Application"
 authors = ["MyWallpaper Team"]
 license = "MIT"
-repository = "https://github.com/MyWallpapers/desktop"
+repository = "https://github.com/MyWallpapers/app"
 edition = "2021"
 
 [lib]
