@@ -310,37 +310,9 @@ pub fn main() {
                     }
                 }
 
-                // Linux/X11: set window type to DESKTOP so it sits below
-                // all application windows but above the actual wallpaper.
-                // Uses PID-based matching to avoid affecting other windows.
-                #[cfg(target_os = "linux")]
-                {
-                    let pid = std::process::id().to_string();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(800));
-
-                        if let Ok(output) = std::process::Command::new("xdotool")
-                            .args(["search", "--pid", &pid, "--name", "MyWallpaper"])
-                            .output()
-                        {
-                            let wids = String::from_utf8_lossy(&output.stdout);
-                            for wid in wids.trim().lines() {
-                                if wid.is_empty() { continue; }
-                                info!("Setting X11 window {} as DESKTOP type", wid);
-                                let _ = std::process::Command::new("xprop")
-                                    .args([
-                                        "-id", wid,
-                                        "-f", "_NET_WM_WINDOW_TYPE", "32a",
-                                        "-set", "_NET_WM_WINDOW_TYPE",
-                                        "_NET_WM_WINDOW_TYPE_DESKTOP",
-                                    ])
-                                    .output();
-                            }
-                        } else {
-                            warn!("xdotool not found — cannot set desktop window type");
-                        }
-                    });
-                }
+                // Linux: no special window type needed.
+                // The window stays at normal level (above desktop icons)
+                // with decorations disabled and fullscreen positioning.
             }
 
             info!("Application setup complete");
