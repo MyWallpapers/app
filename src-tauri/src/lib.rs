@@ -69,6 +69,38 @@ pub use tray::*;
 // Platform-specific desktop wallpaper
 // ============================================================================
 
+/// Windows: stored original window procedure for subclassing
+#[cfg(target_os = "windows")]
+static ORIGINAL_WNDPROC: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Windows: minimal window procedure that blocks "Show Desktop" (Win+D) from hiding this window.
+/// Only intercepts WM_WINDOWPOSCHANGING to strip the SWP_HIDEWINDOW flag.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn desktop_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    if msg == WM_WINDOWPOSCHANGING {
+        let pos = &mut *(lparam.0 as *mut WINDOWPOS);
+        // Strip SWP_HIDEWINDOW — this is how Win+D hides windows
+        pos.flags &= !SWP_HIDEWINDOW;
+    }
+
+    let original = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::SeqCst);
+    CallWindowProcW(
+        std::mem::transmute(original),
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+    )
+}
+
 /// macOS: Configure window collection behavior for desktop wallpaper mode.
 ///
 /// The window stays at normal level (ABOVE desktop icons) but is:
@@ -231,7 +263,7 @@ pub fn main() {
 
                 // === Platform-specific desktop wallpaper integration ===
 
-                // Windows: fullscreen + WS_EX_TOOLWINDOW (immune to Win+D)
+                // Windows: fullscreen + WS_EX_TOOLWINDOW + Win+D block
                 #[cfg(target_os = "windows")]
                 {
                     let _ = window.set_fullscreen(true);
@@ -240,10 +272,15 @@ pub fn main() {
                         use windows::Win32::UI::WindowsAndMessaging::*;
                         let h = HWND(hwnd.0 as *mut core::ffi::c_void);
                         unsafe {
+                            // WS_EX_TOOLWINDOW: exclude from taskbar and Alt+Tab
                             let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
                             SetWindowLongPtrW(h, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
+
+                            // Subclass: block Win+D (Show Desktop) from hiding this window
+                            let original = SetWindowLongPtrW(h, GWLP_WNDPROC, desktop_wndproc as isize);
+                            ORIGINAL_WNDPROC.store(original as *mut _, std::sync::atomic::Ordering::SeqCst);
                         }
-                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW set");
+                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW + Win+D block set");
                     }
                 }
 
