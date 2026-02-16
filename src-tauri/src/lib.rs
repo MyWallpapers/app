@@ -340,67 +340,9 @@ pub fn main() {
                     }
                 }
 
-                // Linux/X11: set window state to BELOW (behind all other windows)
-                // and force exact screen geometry. Uses _NET_WM_STATE instead of
-                // _NET_WM_WINDOW_TYPE_DESKTOP to avoid affecting other windows.
+                // Linux: use native fullscreen to guarantee full screen coverage
                 #[cfg(target_os = "linux")]
-                {
-                    let screen_w = if let Some(m) = window.primary_monitor().ok().flatten() {
-                        let s = m.size();
-                        (s.width, s.height)
-                    } else {
-                        (1920, 1080)
-                    };
-                    let pid = std::process::id().to_string();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(800));
-
-                        if let Ok(output) = std::process::Command::new("xdotool")
-                            .args(["search", "--pid", &pid, "--name", "MyWallpaper"])
-                            .output()
-                        {
-                            let wids = String::from_utf8_lossy(&output.stdout);
-                            for wid in wids.trim().lines() {
-                                if wid.is_empty() { continue; }
-                                info!("Configuring X11 window {} for wallpaper mode", wid);
-
-                                // Set window state: below all windows + sticky (all desktops)
-                                // + skip taskbar/pager
-                                let _ = std::process::Command::new("xprop")
-                                    .args([
-                                        "-id", wid,
-                                        "-f", "_NET_WM_STATE", "32a",
-                                        "-set", "_NET_WM_STATE",
-                                        "_NET_WM_STATE_BELOW, _NET_WM_STATE_STICKY, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER",
-                                    ])
-                                    .output();
-
-                                // Remove any window manager decorations
-                                let _ = std::process::Command::new("xprop")
-                                    .args([
-                                        "-id", wid,
-                                        "-f", "_MOTIF_WM_HINTS", "32c",
-                                        "-set", "_MOTIF_WM_HINTS", "2, 0, 0, 0, 0",
-                                    ])
-                                    .output();
-
-                                // Force exact geometry to cover full screen
-                                let _ = std::process::Command::new("xdotool")
-                                    .args(["windowmove", "--sync", wid, "0", "0"])
-                                    .output();
-                                let _ = std::process::Command::new("xdotool")
-                                    .args([
-                                        "windowsize", "--sync", wid,
-                                        &screen_w.0.to_string(),
-                                        &screen_w.1.to_string(),
-                                    ])
-                                    .output();
-                            }
-                        } else {
-                            warn!("xdotool not found — install xdotool for proper wallpaper mode");
-                        }
-                    });
-                }
+                let _ = window.set_fullscreen(true);
             }
 
             info!("Application setup complete");
