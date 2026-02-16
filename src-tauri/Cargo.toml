@@ -29,7 +29,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = "3"
 typeshare = "1.0"
-ureq = "2"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]
@@ -45,14 +44,6 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
-
-# Linux: CEF (Chromium Embedded Framework) for WebGPU support
-[target.'cfg(target_os = "linux")'.dependencies]
-cef = { git = "https://github.com/tauri-apps/cef-rs", default-features = false }
-download-cef = { git = "https://github.com/tauri-apps/cef-rs" }
-gtk = "0.18"
-glib = "0.18"
-dirs = "6"
 
 [features]
 default = ["custom-protocol"]

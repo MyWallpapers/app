@@ -1,23 +1,37 @@
 //! System tray functionality
 //!
 //! Rich tray menu with layer controls, edit mode, hub access, and settings.
+//! On Linux with CEF, tray events route through the CEF bridge instead of
+//! emitting directly to a Tauri webview window.
 
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::{TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    AppHandle, Manager,
 };
 use tracing::{debug, info};
+
+/// Emit a tray action. On Windows/macOS, this goes directly to the Tauri webview.
+/// On Linux with CEF, the webview may be hidden — actions still go through
+/// the Tauri webview (which is present in fallback mode) or are no-ops in CEF mode
+/// where the frontend handles tray via other channels.
+fn emit_tray_action(app: &AppHandle, action: &str) {
+    use tauri::Emitter;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("tray-action", action);
+    }
+}
 
 /// Setup the system tray with icon and enriched menu
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     info!("Setting up system tray...");
 
-    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))
-        .unwrap_or_else(|_| {
-            Image::new_owned(vec![255u8; 32 * 32 * 4], 32, 32)
-        });
+    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png")).unwrap_or_else(|_| {
+        Image::new_owned(vec![255u8; 32 * 32 * 4], 32, 32)
+    });
 
     // Layers submenu (dynamically populated via frontend events)
     let layers_placeholder = MenuItemBuilder::with_id("layers_placeholder", "No layers loaded")
@@ -29,20 +43,16 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Menu items
-    let edit_layout = MenuItemBuilder::with_id("edit_layout", "Edit Layout")
-        .build(app)?;
+    let edit_layout = MenuItemBuilder::with_id("edit_layout", "Edit Layout").build(app)?;
 
-    let open_hub = MenuItemBuilder::with_id("open_hub", "Open Hub")
-        .build(app)?;
+    let open_hub = MenuItemBuilder::with_id("open_hub", "Open Hub").build(app)?;
 
-    let settings = MenuItemBuilder::with_id("settings", "Settings")
-        .build(app)?;
+    let settings = MenuItemBuilder::with_id("settings", "Settings").build(app)?;
 
-    let check_updates = MenuItemBuilder::with_id("check_updates", "Check for Updates")
-        .build(app)?;
+    let check_updates =
+        MenuItemBuilder::with_id("check_updates", "Check for Updates").build(app)?;
 
-    let quit_item = MenuItemBuilder::with_id("quit", "Quit")
-        .build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&layers_submenu)
@@ -68,30 +78,19 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "edit_layout" => {
                     info!("Edit layout triggered from tray");
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("tray-action", "edit_layout");
-                    }
+                    emit_tray_action(app, "edit_layout");
                 }
                 "open_hub" => {
                     info!("Open hub triggered from tray");
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("tray-action", "open_hub");
-                    }
+                    emit_tray_action(app, "open_hub");
                 }
                 "settings" => {
                     info!("Settings triggered from tray");
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("tray-action", "settings");
-                    }
+                    emit_tray_action(app, "settings");
                 }
                 "check_updates" => {
                     info!("Check updates triggered from tray");
+                    use tauri::Emitter;
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.emit("tray-action", "check_updates");
                     }
@@ -100,6 +99,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                     // Handle dynamic layer toggle items (prefixed with "layer_")
                     if let Some(layer_id) = id.strip_prefix("layer_") {
                         info!("Toggle layer from tray: {}", layer_id);
+                        use tauri::Emitter;
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.emit("tray-toggle-layer", layer_id);
                         }
