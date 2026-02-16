@@ -211,11 +211,3 @@ fn start_with_tauri_webview() {
         .run(tauri::generate_context!())
         .expect("Error while running MyWallpaper Desktop");
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_app_starts() {
-        assert!(true);
-    }
-}

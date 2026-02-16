@@ -125,12 +125,11 @@ pub fn register_layer_shortcut(
         return Ok(());
     }
 
-    let handle = app.clone();
     app.global_shortcut()
-        .on_shortcut(parsed, move |_app, _shortcut, _event| {
+        .on_shortcut(parsed, move |app, _shortcut, event| {
             // Only trigger on key press (not release)
-            if _event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                let state = handle.state::<WindowLayerState>();
+            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                let state = app.state::<WindowLayerState>();
                 let new_mode = {
                     let current = state.mode.lock().unwrap();
                     match *current {
@@ -141,7 +140,7 @@ pub fn register_layer_shortcut(
 
                 info!("Global shortcut triggered, toggling to: {:?}", new_mode);
 
-                if let Some(window) = handle.get_webview_window("main") {
+                if let Some(window) = app.get_webview_window("main") {
                     if let Err(e) = apply_layer_mode(&window, new_mode) {
                         warn!("Failed to apply layer mode: {}", e);
                         return;
@@ -151,7 +150,7 @@ pub fn register_layer_shortcut(
                 let mut current = state.mode.lock().unwrap();
                 *current = new_mode;
 
-                let _ = handle.emit("layer-mode-changed", new_mode);
+                let _ = app.emit("layer-mode-changed", new_mode);
             }
         })
         .map_err(|e| format!("Failed to register shortcut: {}", e))?;
@@ -379,6 +378,18 @@ pub fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
     }
 
     info!("macOS: Interactive Mode configured");
+}
+
+// ---- Unsupported platforms --------------------------------------------------
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn apply_desktop_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
+    Err("Window layer mode is not supported on this platform".to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn apply_interactive_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
+    Err("Window layer mode is not supported on this platform".to_string())
 }
 
 // ============================================================================

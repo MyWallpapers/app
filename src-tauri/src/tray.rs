@@ -1,8 +1,6 @@
 //! System tray functionality
 //!
 //! Rich tray menu with layer controls, edit mode, hub access, and settings.
-//! On Linux with CEF, tray events route through the CEF bridge instead of
-//! emitting directly to a Tauri webview window.
 
 use tauri::{
     image::Image,
@@ -12,10 +10,7 @@ use tauri::{
 };
 use tracing::{debug, info};
 
-/// Emit a tray action. On Windows/macOS, this goes directly to the Tauri webview.
-/// On Linux with CEF, the webview may be hidden — actions still go through
-/// the Tauri webview (which is present in fallback mode) or are no-ops in CEF mode
-/// where the frontend handles tray via other channels.
+/// Emit a tray action to the Tauri webview window.
 fn emit_tray_action(app: &AppHandle, action: &str) {
     use tauri::Emitter;
     if let Some(window) = app.get_webview_window("main") {
@@ -90,10 +85,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "check_updates" => {
                     info!("Check updates triggered from tray");
-                    use tauri::Emitter;
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.emit("tray-action", "check_updates");
-                    }
+                    emit_tray_action(app, "check_updates");
                 }
                 _ => {
                     // Handle dynamic layer toggle items (prefixed with "layer_")
