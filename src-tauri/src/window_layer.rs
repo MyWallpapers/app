@@ -380,16 +380,16 @@ pub fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
     info!("macOS: Interactive Mode configured");
 }
 
-// ---- Unsupported platforms --------------------------------------------------
+// ---- Linux (paused) ---------------------------------------------------------
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn apply_desktop_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
-    Err("Window layer mode is not supported on this platform".to_string())
+    Err("Window layer mode is not yet supported on Linux".to_string())
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn apply_interactive_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
-    Err("Window layer mode is not supported on this platform".to_string())
+    Err("Window layer mode is not yet supported on Linux".to_string())
 }
 
 // ============================================================================
