@@ -266,10 +266,11 @@ pub mod mouse_hook {
 // ============================================================================
 
 pub mod visibility_watchdog {
-    use tauri::{AppHandle, Emitter};
+    use tauri::AppHandle;
 
     #[cfg(target_os = "windows")]
     pub fn start(app: AppHandle) {
+        use tauri::Emitter;
         std::thread::spawn(move || {
             use std::time::Duration;
             use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetDesktopWindow};
@@ -351,7 +352,7 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub mod macos_hook {
-    use tauri::AppHandle;
+    use tauri::{AppHandle, Emitter};
 
     pub fn start_hook_thread(app: AppHandle) {
         std::thread::spawn(move || {
