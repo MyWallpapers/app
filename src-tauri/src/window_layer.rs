@@ -4,9 +4,9 @@
 //!   - Windows: reparent into WorkerW (behind SHELLDLL_DefView)
 //!   - macOS: set window level to kCGDesktopWindowLevel, ignore mouse events
 //!
-//! Interactive Mode: window on top of everything (current behavior).
-//!   - Windows: detach from WorkerW, fullscreen + WS_EX_TOOLWINDOW
-//!   - macOS: normal window level, accept mouse events
+//! Interactive Mode: window behind all apps, above desktop icons, mouse-interactive.
+//!   - Windows: detach from WorkerW, HWND_BOTTOM + WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE
+//!   - macOS: window level between desktop and normal, accept mouse events
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -398,12 +398,24 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         // 1. Detach from WorkerW
         let _ = SetParent(our_hwnd, HWND::default());
 
-        // 2. Ensure WS_EX_TOOLWINDOW (hide from taskbar, same as startup)
+        // 2. WS_EX_TOOLWINDOW (hide from taskbar) + WS_EX_NOACTIVATE (don't steal focus)
         let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, exstyle | WS_EX_TOOLWINDOW.0 as isize);
+        SetWindowLongPtrW(
+            our_hwnd,
+            GWL_EXSTYLE,
+            exstyle | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize,
+        );
+
+        // 3. HWND_BOTTOM: behind all normal apps, above desktop icons
+        //    NO set_fullscreen — that forces the window to the FRONT
+        let _ = SetWindowPos(
+            our_hwnd, HWND_BOTTOM,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 
-    // 3. Restore position + fullscreen (same as initial setup in lib.rs)
+    // 4. Ensure full-screen size (manual, no Tauri fullscreen)
     if let Some(monitor) = window.primary_monitor().ok().flatten() {
         let size = monitor.size();
         let pos = monitor.position();
@@ -412,10 +424,8 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     }
 
     let _ = window.show();
-    let _ = window.set_focus();
-    let _ = window.set_fullscreen(true);
 
-    info!("Windows: Interactive Mode applied");
+    info!("Windows: Interactive Mode applied (HWND_BOTTOM)");
     Ok(())
 }
 
@@ -458,21 +468,22 @@ fn set_macos_desktop_mode(ns_window_ptr: *mut std::ffi::c_void) {
     }
 }
 
-/// Public helper used by lib.rs during initial setup
 #[cfg(target_os = "macos")]
-pub fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
+fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
     use objc::{msg_send, sel, sel_impl};
 
     unsafe {
         let obj = ns_window_ptr as *mut objc::runtime::Object;
-        // NSNormalWindowLevel = 0
-        let _: () = msg_send![obj, setLevel: 0_i64];
+        // Between desktop icons (-2147483623) and normal apps (0).
+        // kCGDesktopWindowLevel + 23 = -2147483600
+        // This keeps us above desktop but below all normal windows.
+        let _: () = msg_send![obj, setLevel: -2147483600_i64];
         // canJoinAllSpaces (1) | stationary (16) | ignoresCycle (64) = 81
         let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
         let _: () = msg_send![obj, setIgnoresMouseEvents: false];
     }
 
-    info!("macOS: Interactive Mode configured");
+    info!("macOS: Interactive Mode configured (level -2147483600)");
 }
 
 // ---- Linux (paused) ---------------------------------------------------------

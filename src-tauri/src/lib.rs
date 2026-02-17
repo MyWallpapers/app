@@ -124,13 +124,12 @@ fn start_with_tauri_webview() {
                 }
             });
 
-            // Setup window to cover full screen
+            // Setup window: transparent, borderless, covering full screen
             if let Some(window) = app.get_webview_window("main") {
-                // Fully transparent background
                 use tauri::webview::Color;
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+                let _ = window.set_decorations(false);
 
-                // Get primary monitor dimensions for fullscreen positioning
                 if let Some(monitor) = window.primary_monitor().ok().flatten() {
                     let size = monitor.size();
                     let position = monitor.position();
@@ -151,28 +150,11 @@ fn start_with_tauri_webview() {
 
                 let _ = window.show();
 
-                // Windows: fullscreen + WS_EX_TOOLWINDOW
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = window.set_fullscreen(true);
-                    if let Ok(hwnd) = window.hwnd() {
-                        use windows::Win32::Foundation::HWND;
-                        use windows::Win32::UI::WindowsAndMessaging::*;
-                        let h = HWND(hwnd.0 as *mut core::ffi::c_void);
-                        unsafe {
-                            let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
-                            SetWindowLongPtrW(h, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
-                        }
-                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW set (Interactive Mode)");
-                    }
-                }
-
-                // macOS: configure collection behavior for Interactive Mode
-                #[cfg(target_os = "macos")]
-                {
-                    if let Ok(ns_window) = window.ns_window() {
-                        window_layer::set_macos_interactive_mode(ns_window);
-                    }
+                // Apply the initial layer mode via window_layer (single source of truth)
+                let state = app.state::<window_layer::WindowLayerState>();
+                let initial_mode = *state.mode.lock().unwrap();
+                if let Err(e) = window_layer::apply_layer_mode_pub(&window, initial_mode) {
+                    warn!("Failed to apply initial layer mode: {}", e);
                 }
             }
 
