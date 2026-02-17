@@ -194,13 +194,18 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         .map_err(|e| format!("Failed to get HWND: {}", e))?;
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
+    // Remove fullscreen BEFORE reparenting to avoid Tauri state conflicts
+    let _ = window.set_fullscreen(false);
+
     unsafe {
         // 1. Find Progman
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman window".to_string())?;
         if progman.is_invalid() {
+            let _ = window.set_fullscreen(true);
             return Err("Could not find Progman window".to_string());
         }
+        info!("Found Progman: {:?}", progman);
 
         // 2. Send magic message to spawn WorkerW
         let mut _result: usize = 0;
@@ -223,6 +228,9 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
             Some(&mut _result),
         );
 
+        // Give Windows time to spawn WorkerW
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
         // 3. Find the WorkerW behind SHELLDLL_DefView
         struct EnumData {
             worker_w: HWND,
@@ -233,7 +241,6 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
 
         unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
             let data = &mut *(lparam.0 as *mut EnumData);
-            // Check if this window has a child called SHELLDLL_DefView
             if let Ok(def_view) = FindWindowExW(
                 hwnd,
                 HWND::default(),
@@ -241,7 +248,6 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
                 None,
             ) {
                 if !def_view.is_invalid() {
-                    // The WorkerW we want is the NEXT one after this one
                     if let Ok(worker) =
                         FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None)
                     {
@@ -258,7 +264,9 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         );
 
         if data.worker_w.is_invalid() {
-            return Err("Could not find WorkerW window".to_string());
+            // Restore fullscreen since desktop mode failed
+            let _ = window.set_fullscreen(true);
+            return Err("Could not find WorkerW — Desktop Mode not available on this system".to_string());
         }
 
         info!("Found WorkerW: {:?}", data.worker_w);
@@ -266,9 +274,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         // 4. Reparent our window into WorkerW
         let _ = SetParent(our_hwnd, data.worker_w);
 
-        // 5. Remove fullscreen (conflicts with reparenting) and resize to cover WorkerW
-        let _ = window.set_fullscreen(false);
-
+        // 5. Resize to cover WorkerW
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(data.worker_w, &mut rect);
         let _ = SetWindowPos(
@@ -278,10 +284,10 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
             0,
             rect.right - rect.left,
             rect.bottom - rect.top,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
 
-        // Remove WS_EX_TOOLWINDOW since we're behind icons now
+        // 6. Remove WS_EX_TOOLWINDOW since we're behind icons now
         let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(
             our_hwnd,
@@ -306,18 +312,37 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // Detach from WorkerW (reparent to desktop/null)
+        // 1. Detach from WorkerW (reparent to desktop/null)
         let _ = SetParent(our_hwnd, HWND::default());
 
-        // Restore fullscreen + WS_EX_TOOLWINDOW
-        let _ = window.set_fullscreen(true);
-
+        // 2. Set WS_EX_TOOLWINDOW to hide from taskbar
         let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
-
-        info!("Windows: Interactive Mode applied (detached from WorkerW)");
     }
 
+    // 3. Restore window position to cover primary monitor (same as startup in lib.rs)
+    if let Some(monitor) = window.primary_monitor().ok().flatten() {
+        let size = monitor.size();
+        let position = monitor.position();
+        info!(
+            "Restoring to primary monitor: {}x{} at ({}, {})",
+            size.width, size.height, position.x, position.y
+        );
+        let _ = window.set_position(tauri::Position::Physical(
+            tauri::PhysicalPosition::new(position.x, position.y),
+        ));
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+            size.width,
+            size.height,
+        )));
+    }
+
+    // 4. Show, focus, then fullscreen
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = window.set_fullscreen(true);
+
+    info!("Windows: Interactive Mode applied (detached from WorkerW)");
     Ok(())
 }
 
