@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "objc",
  "os_info",
@@ -2206,6 +2206,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "typeshare",
+ "url",
  "windows 0.58.0",
 ]
 

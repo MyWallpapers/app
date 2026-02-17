@@ -24,54 +24,84 @@ pub fn get_system_info() -> SystemInfo {
 // Auto-Update Commands
 // ============================================================================
 
-/// Check for application updates and return detailed info
+/// Check for application updates and return detailed info.
+/// When `endpoint` is provided, uses a custom updater endpoint (e.g. for pre-release builds).
+/// Otherwise uses the default endpoint from tauri.conf.json.
 #[tauri::command]
-pub async fn check_for_updates(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+pub async fn check_for_updates(
+    app: tauri::AppHandle,
+    endpoint: Option<String>,
+) -> Result<Option<UpdateInfo>, String> {
     use tauri_plugin_updater::UpdaterExt;
 
-    info!("Checking for updates...");
+    info!("Checking for updates (endpoint: {:?})...", endpoint);
 
-    match app.updater() {
-        Ok(updater) => match updater.check().await {
-            Ok(Some(update)) => {
-                info!("Update available: v{}", update.version);
-                Ok(Some(UpdateInfo {
-                    version: update.version.clone(),
-                    current_version: env!("CARGO_PKG_VERSION").to_string(),
-                    body: update.body.clone(),
-                    date: update.date.map(|d| d.to_string()),
-                }))
-            }
-            Ok(None) => {
-                info!("No updates available");
-                Ok(None)
-            }
-            Err(e) => {
-                tracing::error!("Update check failed: {}", e);
-                Err(format!("Update check failed: {}", e))
-            }
-        },
+    let updater = if let Some(url) = endpoint {
+        let parsed: url::Url = url
+            .parse()
+            .map_err(|e| format!("Invalid endpoint URL: {}", e))?;
+        app.updater_builder()
+            .endpoints(vec![parsed])
+            .map_err(|e| format!("Invalid endpoint: {}", e))?
+            .build()
+            .map_err(|e| format!("Failed to build updater: {}", e))?
+    } else {
+        app.updater()
+            .map_err(|e| format!("Updater not available: {}", e))?
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            info!("Update available: v{}", update.version);
+            Ok(Some(UpdateInfo {
+                version: update.version.clone(),
+                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                body: update.body.clone(),
+                date: update.date.map(|d| d.to_string()),
+            }))
+        }
+        Ok(None) => {
+            info!("No updates available");
+            Ok(None)
+        }
         Err(e) => {
-            tracing::error!("Failed to get updater: {}", e);
-            Err(format!("Updater not available: {}", e))
+            tracing::error!("Update check failed: {}", e);
+            Err(format!("Update check failed: {}", e))
         }
     }
 }
 
-/// Download and install the available update
+/// Download and install the available update.
+/// When `endpoint` is provided, uses a custom updater endpoint (e.g. for pre-release builds).
 #[tauri::command]
-pub async fn download_and_install_update(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn download_and_install_update(
+    app: tauri::AppHandle,
+    endpoint: Option<String>,
+) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
 
-    info!("Starting update download and install...");
+    info!(
+        "Starting update download and install (endpoint: {:?})...",
+        endpoint
+    );
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.emit("update-progress", "checking");
     }
 
-    let updater = app
-        .updater()
-        .map_err(|e| format!("Updater not available: {}", e))?;
+    let updater = if let Some(url) = endpoint {
+        let parsed: url::Url = url
+            .parse()
+            .map_err(|e| format!("Invalid endpoint URL: {}", e))?;
+        app.updater_builder()
+            .endpoints(vec![parsed])
+            .map_err(|e| format!("Invalid endpoint: {}", e))?
+            .build()
+            .map_err(|e| format!("Failed to build updater: {}", e))?
+    } else {
+        app.updater()
+            .map_err(|e| format!("Updater not available: {}", e))?
+    };
 
     let update = updater
         .check()
