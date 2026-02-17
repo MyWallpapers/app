@@ -8,9 +8,6 @@
 use tracing::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(target_os = "macos")] // Correction: On ne l'importe que sur macOS pour éviter le warning Windows
-use tauri::Manager; 
-
 // Flag de sécurité pour ne pas spammer le système à la fermeture
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 
@@ -56,6 +53,7 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
+        // Sur macOS, on désactive l'affichage du bureau via le Finder
         let val = if visible { "true" } else { "false" };
         let _ = std::process::Command::new("defaults")
             .args(["write", "com.apple.finder", "CreateDesktop", val])
@@ -71,6 +69,7 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
 
 /// Sécurité : Appelé automatiquement à la fermeture de l'app pour rendre le bureau
 pub fn restore_desktop_icons() {
+    // Si on l'a déjà fait, on annule pour éviter le double "killall Finder"
     if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
         return; 
     }
@@ -92,6 +91,7 @@ pub fn restore_desktop_icons() {
 
     #[cfg(target_os = "macos")]
     {
+        // Sur macOS, on s'assure que le Finder réaffiche les icônes
         let _ = std::process::Command::new("defaults")
             .args(["write", "com.apple.finder", "CreateDesktop", "true"])
             .output();
@@ -160,7 +160,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
 
         let current_parent = GetParent(our_hwnd);
-        // Correction: GetParent renvoie un Result dans windows v0.58
+        // Correction Windows 0.58: GetParent renvoie un Result<HWND>
         if current_parent != Ok(found.worker_w) {
             let _ = SetParent(our_hwnd, found.worker_w);
             let mut rect = windows::Win32::Foundation::RECT::default();
@@ -191,7 +191,8 @@ pub mod mouse_hook {
 
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
-        use windows::core::VARIANT; // Correction: Le type VARIANT est dans windows::core pour v0.58
+        // Correction Windows 0.58: VARIANT est dans windows::core
+        use windows::core::VARIANT;
 
         let pt = windows::Win32::Foundation::POINT { x, y };
         let mut p_acc: Option<IAccessible> = None;
@@ -199,10 +200,16 @@ pub mod mouse_hook {
 
         if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
             if let Some(acc) = p_acc {
-                // Correction: get_accRole prend 1 paramètre et renvoie directement un Result<VARIANT>
+                // Correction Windows 0.58: get_accRole prend 1 seul paramètre et retourne Result<VARIANT>
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
-                    let role_val = role_var.Anonymous.Anonymous.Anonymous.lVal as u32;
-                    if role_val == 34 { return true; } // 34 = ROLE_SYSTEM_LISTITEM
+                    // On essaie de convertir proprement le VARIANT en i32
+                    if let Ok(role_val) = i32::try_from(&role_var) {
+                        if role_val == 34 { return true; } // 34 = ROLE_SYSTEM_LISTITEM
+                    } else {
+                        // Méthode de secours infaillible: lecture de l'offset 8 du pointeur mémoire (lVal)
+                        let raw_val: i32 = std::ptr::read((&role_var as *const _ as *const u8).add(8) as *const i32);
+                        if raw_val == 34 { return true; }
+                    }
                 }
             }
         }
@@ -331,6 +338,8 @@ pub mod visibility_watchdog {
 
 #[cfg(target_os = "macos")]
 fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use tauri::Manager; // On importe Manager uniquement pour macOS (évite le warning sur Windows)
+
     let ns_window = window.ns_window().map_err(|e| format!("Failed to get NSWindow: {}", e))? as *mut std::ffi::c_void;
 
     use objc::{msg_send, sel, sel_impl};
@@ -378,7 +387,14 @@ pub mod macos_hook {
                     Ok(tap) => {
                         tracing::info!("macOS: Hook souris attaché avec succès !");
                         let run_loop_source = tap.mach_port.create_runloop_source(0).unwrap();
-                        core_foundation::runloop::CFRunLoop::get_current().add_source(&run_loop_source, core_foundation::runloop::kCFRunLoopCommonModes);
+                        
+                        unsafe {
+                            // Block unsafe nécessaire pour appeler les constantes C d'Apple
+                            core_foundation::runloop::CFRunLoop::get_current().add_source(
+                                &run_loop_source, 
+                                core_foundation::runloop::kCFRunLoopCommonModes
+                            );
+                        }
                         
                         tap.enable();
                         core_foundation::runloop::CFRunLoop::run_current();
