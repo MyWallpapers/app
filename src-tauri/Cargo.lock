@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.59"
+version = "1.0.60"
 dependencies = [
  "core-foundation 0.9.4",
  "core-graphics 0.23.2",
@@ -2357,7 +2357,6 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
- "tracing",
  "typeshare",
  "url",
  "windows 0.58.0",

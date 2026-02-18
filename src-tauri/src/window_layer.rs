@@ -251,13 +251,9 @@ pub mod mouse_hook {
             if let Some(acc) = p_acc {
                 // Correction Windows 0.58: get_accRole prend 1 seul paramètre et retourne Result<VARIANT>
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
-                    // On essaie de convertir proprement le VARIANT en i32
+                    // Méthode sûre via TryFrom (nécessite windows 0.58+)
                     if let Ok(role_val) = i32::try_from(&role_var) {
                         if role_val == 34 { return true; } // 34 = ROLE_SYSTEM_LISTITEM
-                    } else {
-                        // Méthode de secours infaillible: lecture de l'offset 8 du pointeur mémoire (lVal)
-                        let raw_val: i32 = std::ptr::read((&role_var as *const _ as *const u8).add(8) as *const i32);
-                        if raw_val == 34 { return true; }
                     }
                 }
             }
@@ -319,7 +315,7 @@ pub mod mouse_hook {
 
             unsafe {
                 if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
-                    tracing::info!("Global mouse hook installed (Hybrid Mode): {:?}", h);
+                    log::info!("Global mouse hook installed (Hybrid Mode): {:?}", h);
                     let mut msg = MSG::default();
                     while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                         let _ = TranslateMessage(&msg);
@@ -357,6 +353,7 @@ pub mod visibility_watchdog {
                     let fg_hwnd = GetForegroundWindow();
                     let desk_hwnd = GetDesktopWindow();
 
+                    // Si on est sur le bureau, on est forcément visible
                     if fg_hwnd == desk_hwnd || fg_hwnd.is_invalid() {
                         if !was_visible {
                             let _ = app.emit("wallpaper-visibility", true);
@@ -365,13 +362,30 @@ pub mod visibility_watchdog {
                         continue;
                     }
 
-                    let hmonitor = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTOPRIMARY);
-                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    // --- RAFFINEMENT MULTI-ÉCRANS ---
+                    // On récupère le moniteur de la fenêtre au premier plan
+                    let hmonitor_fg = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTOPRIMARY);
                     
-                    if GetMonitorInfoW(hmonitor, &mut mi).as_bool() {
+                    // On récupère le moniteur de notre fond d'écran (via son HWND stocké)
+                    let wv_hwnd = super::mouse_hook::get_webview_hwnd();
+                    if wv_hwnd == 0 { continue; }
+                    let hmonitor_wv = MonitorFromWindow(HWND(wv_hwnd as *mut _), MONITOR_DEFAULTTOPRIMARY);
+
+                    // Si la fenêtre au premier plan n'est pas sur le même écran que nous, on reste visible
+                    if hmonitor_fg != hmonitor_wv {
+                        if !was_visible {
+                            let _ = app.emit("wallpaper-visibility", true);
+                            was_visible = true;
+                        }
+                        continue;
+                    }
+
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    if GetMonitorInfoW(hmonitor_fg, &mut mi).as_bool() {
                         let mut fg_rect = RECT::default();
                         let _ = GetWindowRect(fg_hwnd, &mut fg_rect);
 
+                        // On vérifie si la fenêtre remplit tout le moniteur (Plein écran / Jeu)
                         let is_fullscreen = fg_rect.left <= mi.rcMonitor.left
                             && fg_rect.top <= mi.rcMonitor.top
                             && fg_rect.right >= mi.rcMonitor.right
@@ -429,7 +443,7 @@ pub mod macos_hook {
             use core_graphics::event::{CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType, CGEventTap};
             use std::time::Duration;
 
-            tracing::info!("macOS: Démarrage du Hook de souris en arrière-plan (Nécessite les droits d'Accessibilité)");
+            log::info!("macOS: Démarrage du Hook de souris en arrière-plan (Nécessite les droits d'Accessibilité)");
 
             loop {
                 let tap_result = CGEventTap::new(
@@ -448,7 +462,7 @@ pub mod macos_hook {
 
                 match tap_result {
                     Ok(tap) => {
-                        tracing::info!("macOS: Hook souris attaché avec succès !");
+                        log::info!("macOS: Hook souris attaché avec succès !");
                         let run_loop_source = tap.mach_port.create_runloop_source(0).unwrap();
                         
                         unsafe {
@@ -464,7 +478,7 @@ pub mod macos_hook {
                         break;
                     }
                     Err(_) => {
-                        tracing::warn!("macOS: Droits d'accessibilité manquants. En attente de l'autorisation...");
+                        log::warn!("macOS: Droits d'accessibilité manquants. En attente de l'autorisation...");
                         std::thread::sleep(Duration::from_secs(3));
                     }
                 }

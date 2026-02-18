@@ -71,7 +71,7 @@ fn start_with_tauri_webview() {
             let handle = app.handle().clone();
 
             if let Err(e) = tray::setup_tray(&handle) {
-                tracing::error!("Failed to setup system tray: {}", e);
+                log::error!("Failed to setup system tray: {}", e);
             }
 
             let deep_link_handle = handle.clone();

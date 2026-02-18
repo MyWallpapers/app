@@ -5,7 +5,7 @@
 
 use crate::commands_core;
 use tauri::{Emitter, Manager};
-use tracing::info;
+use log::info;
 
 // Re-export core types so existing `use crate::commands::*` still works
 pub use commands_core::{SystemInfo, UpdateInfo};
@@ -65,7 +65,7 @@ pub async fn check_for_updates(
             Ok(None)
         }
         Err(e) => {
-            tracing::error!("Update check failed: {}", e);
+            log::error!("Update check failed: {}", e);
             Err(format!("Update check failed: {}", e))
         }
     }
@@ -119,7 +119,7 @@ pub async fn download_and_install_update(
         .download_and_install(
             |chunk_length, content_length| {
                 if let Some(len) = content_length {
-                    tracing::debug!("Download progress: {}%", chunk_length * 100 / len as usize);
+                    log::debug!("Download progress: {}%", chunk_length * 100 / len as usize);
                 }
             },
             || {
