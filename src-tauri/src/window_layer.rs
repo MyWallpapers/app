@@ -284,11 +284,24 @@ pub mod mouse_hook {
                     if wv_hwnd != 0 {
                         let wv = HWND(wv_hwnd as *mut core::ffi::c_void);
                         
-                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
+                        // CORRECTION CRITIQUE : On identifie la fenêtre sur laquelle on pointe
+                        let hwnd_under = WindowFromPoint(pt);
+                        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+                        
+                        // On vérifie si la souris pointe sur le bureau, notre WebView, ou le moteur Chromium (IsChild)
+                        let is_over_desktop = hwnd_under == slv || hwnd_under == wv || IsChild(wv, hwnd_under).as_bool();
+                        
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
-                        // 1. MACHINE À ÉTATS (Bloque le focus sur les icônes de bureau)
+                        // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
+                        if state == STATE_IDLE && !is_over_desktop {
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                        }
+
+                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
+
+                        // 1. MACHINE À ÉTATS
                         if is_down && state == STATE_IDLE {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 state = STATE_NATIVE;
@@ -303,7 +316,7 @@ pub mod mouse_hook {
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // 2. CORRECTION DU CACHE EMPOISONNÉ
+                        // 2. LE CACHE PROPRE
                         let mut target = HWND(RENDER_WIDGET_HWND.load(Ordering::Relaxed) as *mut _);
                         if target.is_invalid() || !IsWindow(target).as_bool() {
                             struct S { res: HWND }
@@ -313,52 +326,44 @@ pub mod mouse_hook {
                                 let len = GetClassNameW(h, &mut n);
                                 if String::from_utf16_lossy(&n[..len as usize]).starts_with("Chrome_RenderWidgetHostHWND") {
                                     (*(l.0 as *mut S)).res = h;
-                                    return BOOL(0);
+                                    return BOOL(0); 
                                 }
                                 BOOL(1)
                             }
                             let _ = EnumChildWindows(wv, Some(cb), LPARAM(&mut s as *mut _ as isize));
                             
                             if !s.res.is_invalid() {
-                                // Moteur trouvé ! On le met en cache définitivement.
                                 target = s.res;
                                 RENDER_WIDGET_HWND.store(target.0 as isize, Ordering::Relaxed);
                             } else {
-                                // Moteur pas encore prêt (App en cours de lancement). 
-                                // On utilise wv comme fallback, MAIS ON NE LE MET SURTOUT PAS EN CACHE !
                                 target = wv; 
                             }
                         }
 
-                        // 3. PACKING PARFAIT DES COORDONNÉES
+                        // 3. COORDONNÉES ABSOLUES
                         let mut client_pt = pt;
                         let _ = ScreenToClient(target, &mut client_pt);
-                        
-                        // Sécurité mathématique: on force l'alignement sur 16 bits même avec des coordonnées négatives
                         let lp = (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize;
 
-                        // 4. CORRECTION DES DRAPEAUX ET DE LA MOLETTE
                         let mut wp: usize = 0;
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
-                            wp |= 0x0001; // MK_LBUTTON
+                            wp |= 0x0001; 
                         }
                         if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
-                            wp |= 0x0002; // MK_RBUTTON
+                            wp |= 0x0002; 
                         }
                         if msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP {
-                            wp |= 0x0010; // MK_MBUTTON
+                            wp |= 0x0010; 
                         }
                         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            // On restaure les bits de direction intacts !
                             wp = (info.mouseData & 0xFFFF0000) as usize; 
                         }
 
-                        // 5. ENVOI AU WEB
+                        // 4. INJECTION DIRECTE
                         let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        // On bloque l'événement physique si ce n'est pas un mouvement.
                         if msg != WM_MOUSEMOVE {
                             return LRESULT(1);
                         }
