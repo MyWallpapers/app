@@ -532,6 +532,13 @@ pub mod mouse_hook {
                         if let Some(handle) = APP_HANDLE.get() {
                             use tauri::Emitter;
 
+                            // Log first event + periodic for diagnostics
+                            static EMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            let n = EMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            if n == 0 || n % 500 == 0 {
+                                log::info!("[EMIT] desktop-mouse #{} msg=0x{:X} pt=({},{}) state={}", n, msg, pt.x, pt.y, state);
+                            }
+
                             match msg {
                                 WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                                     let delta = (info.mouseData >> 16) as i16;
