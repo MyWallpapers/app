@@ -219,6 +219,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
     }
 
+    // ON DONNE L'APP AU HOOK ICI
+    mouse_hook::set_app_handle(window.app_handle().clone());
     mouse_hook::start_hook_thread();
     Ok(())
 }
