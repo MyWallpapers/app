@@ -179,6 +179,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Publish first — gh release download/delete-asset don't work on drafts.
+      # The release is briefly public without latest.json (updater gets 404, retries later).
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.bump-version.outputs.tag }}"
+          echo "Publishing release ${TAG}..."
+          gh release edit "$TAG" --draft=false --repo ${{ github.repository }}
+          echo "✅ Release ${TAG} published"
+
       # Build the canonical latest.json from all .sig assets in the release.
       # This runs once after all builds, so there's no race condition.
       - name: Generate updater manifest
@@ -193,16 +204,15 @@ jobs:
           # Remove any partial latest.json left by tauri-action
           gh release delete-asset "$TAG" latest.json --yes --repo "$REPO" 2>/dev/null || true
 
-          # Get release metadata (gh release view --json returns empty for draft releases)
-          RELEASE_JSON=$(gh api repos/"$REPO"/releases --jq '.[] | select(.tag_name=="'"$TAG"'")')
-          PUB_DATE=$(echo "$RELEASE_JSON" | jq -r '.created_at')
-          BODY=$(echo "$RELEASE_JSON" | jq -r '.body')
+          # Get release metadata
+          PUB_DATE=$(gh release view "$TAG" --json createdAt --jq '.createdAt' --repo "$REPO")
+          BODY=$(gh release view "$TAG" --json body --jq '.body' --repo "$REPO")
 
           # Start with empty platforms object
           PLATFORMS='{}'
 
           # Map .sig files to Tauri updater platform identifiers
-          ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[].name')
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo "$REPO")
           TMP_DIR=$(mktemp -d)
 
           for SIG_FILE in $ASSETS; do
@@ -253,12 +263,3 @@ jobs:
           # Upload to release
           gh release upload "$TAG" latest.json --repo "$REPO"
           echo "✓ Updater manifest uploaded"
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.bump-version.outputs.tag }}"
-          echo "Publishing release ${TAG}..."
-          gh release edit "$TAG" --draft=false --repo ${{ github.repository }}
-          echo "✅ Release ${TAG} published!"
