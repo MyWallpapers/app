@@ -163,7 +163,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.bump-version.outputs.tag }}"
-          ASSETS=$(gh release view "$TAG" --json assets --jq '[.assets[].name | select(endswith(".sig"))]' --repo ${{ github.repository }})
+          # gh release view --json assets returns empty for draft releases — use API directly
+          ASSETS=$(gh api repos/${{ github.repository }}/releases --jq '.[] | select(.tag_name=="'"$TAG"'") | [.assets[].name | select(endswith(".sig"))]')
           COUNT=$(echo "$ASSETS" | jq 'length')
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::No .sig artifacts found in release — build failed"
@@ -192,15 +193,16 @@ jobs:
           # Remove any partial latest.json left by tauri-action
           gh release delete-asset "$TAG" latest.json --yes --repo "$REPO" 2>/dev/null || true
 
-          # Get release metadata
-          PUB_DATE=$(gh release view "$TAG" --json createdAt --jq '.createdAt' --repo "$REPO")
-          BODY=$(gh release view "$TAG" --json body --jq '.body' --repo "$REPO")
+          # Get release metadata (gh release view --json returns empty for draft releases)
+          RELEASE_JSON=$(gh api repos/"$REPO"/releases --jq '.[] | select(.tag_name=="'"$TAG"'")')
+          PUB_DATE=$(echo "$RELEASE_JSON" | jq -r '.created_at')
+          BODY=$(echo "$RELEASE_JSON" | jq -r '.body')
 
           # Start with empty platforms object
           PLATFORMS='{}'
 
           # Map .sig files to Tauri updater platform identifiers
-          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo "$REPO")
+          ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[].name')
           TMP_DIR=$(mktemp -d)
 
           for SIG_FILE in $ASSETS; do
