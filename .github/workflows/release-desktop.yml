@@ -65,24 +65,7 @@ jobs:
           git tag "${{ steps.bump.outputs.tag }}"
           git push origin main "${{ steps.bump.outputs.tag }}"
 
-      # Create the draft release ONCE here, before matrix builds start.
-      # This prevents tauri-action race conditions where multiple matrix jobs
-      # each create a separate release with the same tag.
-      - name: Create draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.bump.outputs.tag }}"
-          PRERELEASE="${{ inputs.mode == 'dev' && '--prerelease' || '' }}"
-          BODY="See the assets to download and install.${{ inputs.mode == 'dev' && ' ⚠️ DEV BUILD — unoptimized, devtools enabled.' || '' }}"
-          gh release create "$TAG" \
-            --draft \
-            $PRERELEASE \
-            --title "MyWallpaper Desktop ${TAG}" \
-            --notes "$BODY" \
-            --repo ${{ github.repository }}
-
-  publish-tauri:
+  build-tauri:
     needs: bump-version
     permissions:
       contents: write
@@ -92,13 +75,17 @@ jobs:
         include:
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
+            artifact: macos-aarch64
           - platform: macos-latest
             args: "--target x86_64-apple-darwin"
+            artifact: macos-x64
           # Linux paused — re-enable when WebGPU support is resolved
           # - platform: ubuntu-22.04
           #   args: ""
+          #   artifact: linux
           - platform: windows-latest
             args: ""
+            artifact: windows
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -135,88 +122,79 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
           echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
 
-      # tauri-action uploads binaries + .sig files to the draft release.
-      # It also tries to upload latest.json, which may race across matrix
-      # jobs — that's fine, we ignore the race and rebuild latest.json
-      # authoritatively in publish-release after all builds complete.
-      - name: Build and publish
+      # Build only — no release management. Artifacts uploaded separately.
+      - name: Build
         uses: tauri-apps/tauri-action@v0.5
-        continue-on-error: true
         id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ needs.bump-version.outputs.tag }}
-          releaseName: "MyWallpaper Desktop ${{ needs.bump-version.outputs.tag }}"
-          releaseBody: "See the assets to download and install.${{ inputs.mode == 'dev' && ' ⚠️ DEV BUILD — unoptimized, devtools enabled.' || '' }}"
-          releaseDraft: true
-          prerelease: ${{ inputs.mode == 'dev' }}
+          includeRelease: false
+          includeUpdaterJson: false
           args: ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
 
-      # Fail the job if the actual build failed (not just latest.json race).
-      # Check: if no .sig files were uploaded for this platform, the build truly failed.
-      - name: Verify build artifacts
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.bump-version.outputs.tag }}"
-          # gh release view --json assets returns empty for draft releases — use API directly
-          ASSETS=$(gh api repos/${{ github.repository }}/releases --jq '.[] | select(.tag_name=="'"$TAG"'") | [.assets[].name | select(endswith(".sig"))]')
-          COUNT=$(echo "$ASSETS" | jq 'length')
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::No .sig artifacts found in release — build failed"
-            exit 1
-          fi
-          echo "✓ Found $COUNT signature files in release"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.tauri.outputs.artifactPaths }}
+          if-no-files-found: error
 
   publish-release:
-    needs: [bump-version, publish-tauri]
-    if: ${{ !cancelled() && needs.bump-version.result == 'success' }}
+    needs: [bump-version, build-tauri]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # Publish first — gh release download/delete-asset don't work on drafts.
-      # The release is briefly public without latest.json (updater gets 404, retries later).
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.bump-version.outputs.tag }}"
-          echo "Publishing release ${TAG}..."
-          gh release edit "$TAG" --draft=false --repo ${{ github.repository }}
-          echo "✅ Release ${TAG} published"
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
 
-      # Build the canonical latest.json from all .sig assets in the release.
-      # This runs once after all builds, so there's no race condition.
-      - name: Generate updater manifest
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.bump-version.outputs.tag }}"
           VERSION="${{ needs.bump-version.outputs.version }}"
           REPO="${{ github.repository }}"
+          PRERELEASE="${{ inputs.mode == 'dev' && '--prerelease' || '' }}"
+          BODY="See the assets to download and install.${{ inputs.mode == 'dev' && ' ⚠️ DEV BUILD — unoptimized, devtools enabled.' || '' }}"
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
-          # Remove any partial latest.json left by tauri-action
-          gh release delete-asset "$TAG" latest.json --yes --repo "$REPO" 2>/dev/null || true
+          echo "=== Downloaded artifacts ==="
+          find . -type f | sort
+          echo ""
 
-          # Get release metadata
+          # Create release and upload all binaries + signatures
+          FILES=$(find . -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.msi" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \) | sort)
+
+          if [ -z "$FILES" ]; then
+            echo "::error::No release artifacts found"
+            exit 1
+          fi
+
+          echo "=== Uploading to release ==="
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            $PRERELEASE \
+            --title "MyWallpaper Desktop ${TAG}" \
+            --notes "$BODY" \
+            --repo "$REPO" \
+            $FILES
+
+          echo "✅ Release created with $(echo "$FILES" | wc -l) files"
+
+          # Build updater manifest (latest.json)
           PUB_DATE=$(gh release view "$TAG" --json createdAt --jq '.createdAt' --repo "$REPO")
-          BODY=$(gh release view "$TAG" --json body --jq '.body' --repo "$REPO")
-
-          # Start with empty platforms object
           PLATFORMS='{}'
-
-          # Map .sig files to Tauri updater platform identifiers
-          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo "$REPO")
           TMP_DIR=$(mktemp -d)
 
-          for SIG_FILE in $ASSETS; do
-            # Only process .sig files for updater artifacts
+          SIG_FILES=$(find . -name "*.sig" -type f)
+          for SIG_PATH in $SIG_FILES; do
+            SIG_FILE=$(basename "$SIG_PATH")
             case "$SIG_FILE" in
               *_aarch64.app.tar.gz.sig)   PLATFORM="darwin-aarch64" ;;
               *_x64.app.tar.gz.sig)       PLATFORM="darwin-x86_64" ;;
@@ -227,10 +205,7 @@ jobs:
 
             ARTIFACT="${SIG_FILE%.sig}"
             URL="${BASE_URL}/${ARTIFACT}"
-
-            # Download signature content
-            gh release download "$TAG" --pattern "$SIG_FILE" --dir "$TMP_DIR" --repo "$REPO"
-            SIG=$(cat "${TMP_DIR}/${SIG_FILE}")
+            SIG=$(cat "$SIG_PATH")
 
             PLATFORMS=$(echo "$PLATFORMS" | jq \
               --arg p "$PLATFORM" \
@@ -241,15 +216,12 @@ jobs:
             echo "  ✓ $PLATFORM → $ARTIFACT"
           done
 
-          rm -rf "$TMP_DIR"
-
           PLATFORM_COUNT=$(echo "$PLATFORMS" | jq 'keys | length')
           if [ "$PLATFORM_COUNT" -eq 0 ]; then
-            echo "::error::No updater platforms found in release assets"
+            echo "::error::No updater platforms found"
             exit 1
           fi
 
-          # Build latest.json
           jq -n \
             --arg version "$VERSION" \
             --arg notes "$BODY" \
@@ -260,6 +232,5 @@ jobs:
           echo "Generated latest.json with $PLATFORM_COUNT platforms:"
           jq . latest.json
 
-          # Upload to release
           gh release upload "$TAG" latest.json --repo "$REPO"
-          echo "✓ Updater manifest uploaded"
+          echo "✅ Updater manifest uploaded"
