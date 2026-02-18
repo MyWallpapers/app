@@ -288,6 +288,8 @@ pub mod mouse_hook {
 
                         let msg = wparam.0 as u32;
                         let mut client_pt = pt;
+                        
+                        // On calcule les coordonnées par rapport à la fenêtre principale
                         let _ = ScreenToClient(wv, &mut client_pt);
                         let lparam_fw = ((client_pt.y as isize) << 16) | (client_pt.x as isize & 0xFFFF);
 
@@ -296,7 +298,19 @@ pub mod mouse_hook {
                             fw_wparam = (info.mouseData & 0xFFFF_0000) as usize;
                         }
 
-                        let _ = PostMessageW(wv, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
+                        // --- CORRECTION INTERACTIVITÉ WEBVIEW2 ---
+                        // On cherche la vraie sous-fenêtre Chromium qui gère la page Web
+                        let mut target_hwnd = wv;
+                        let cw0 = FindWindowExW(wv, HWND::default(), windows::core::w!("Chrome_WidgetWin_0"), None).unwrap_or(HWND::default());
+                        if !cw0.is_invalid() {
+                            let crw = FindWindowExW(cw0, HWND::default(), windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or(HWND::default());
+                            if !crw.is_invalid() {
+                                target_hwnd = crw; // C'est LUI qui doit recevoir le clic !
+                            }
+                        }
+
+                        // On envoie le clic au moteur Web
+                        let _ = PostMessageW(target_hwnd, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
                         return LRESULT(1);
                     }
                 }
