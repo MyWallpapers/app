@@ -182,8 +182,10 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
             return Err("Impossible de s'injecter : Ni l'architecture Windows 11 24H2, ni la Legacy n'ont pu être construites.".to_string());
         }
 
-        // Configuration du Hook de la souris
+        // Configuration du Hook de la souris — on enregistre TOUS les HWND de la hiérarchie desktop
         mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
+        mouse_hook::set_shell_view_hwnd(shell_view.0 as isize);
+        mouse_hook::set_target_parent_hwnd(target_parent.0 as isize);
         if let Ok(slv) = FindWindowExW(shell_view, HWND::default(), windows::core::w!("SysListView32"), None) {
             if !slv.is_invalid() {
                 mouse_hook::set_syslistview_hwnd(slv.0 as isize);
@@ -232,6 +234,8 @@ pub mod mouse_hook {
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
+    static SHELL_VIEW_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
 
     static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
@@ -244,6 +248,8 @@ pub mod mouse_hook {
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_shell_view_hwnd(hwnd: isize) { SHELL_VIEW_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_target_parent_hwnd(hwnd: isize) { TARGET_PARENT_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
 
@@ -285,12 +291,19 @@ pub mod mouse_hook {
                     if wv_hwnd != 0 {
                         let wv = HWND(wv_hwnd as *mut core::ffi::c_void);
                         
-                        // CORRECTION CRITIQUE : On identifie la fenêtre sur laquelle on pointe
+                        // On identifie la fenêtre sous le curseur et on vérifie si elle fait partie
+                        // de la hiérarchie desktop (Progman/WorkerW/SHELLDLL_DefView/SysListView32/WebView)
                         let hwnd_under = WindowFromPoint(pt);
                         let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
-                        
-                        // On vérifie si la souris pointe sur le bureau, notre WebView, ou le moteur Chromium (IsChild)
-                        let is_over_desktop = hwnd_under == slv || hwnd_under == wv || IsChild(wv, hwnd_under).as_bool();
+                        let sv = HWND(SHELL_VIEW_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+                        let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+
+                        let is_over_desktop = hwnd_under == slv
+                            || hwnd_under == wv
+                            || hwnd_under == sv    // SHELLDLL_DefView
+                            || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
+                            || IsChild(wv, hwnd_under).as_bool()   // Chrome_RenderWidgetHostHWND etc.
+                            || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
                         
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
@@ -356,10 +369,16 @@ pub mod mouse_hook {
                             }
                         }
 
-                        // 3. COORDONNÉES ABSOLUES
-                        let mut client_pt = pt;
-                        let _ = ScreenToClient(target, &mut client_pt);
-                        let lp = (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize;
+                        // 3. COORDONNÉES
+                        // WM_MOUSEWHEEL/MOUSEHWHEEL utilisent des coordonnées ÉCRAN dans LPARAM
+                        // Tous les autres messages (MOUSEMOVE, BUTTONDOWN, etc.) utilisent des coordonnées CLIENT
+                        let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                            (((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)) as isize
+                        } else {
+                            let mut client_pt = pt;
+                            let _ = ScreenToClient(target, &mut client_pt);
+                            (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize
+                        };
 
                         let mut wp: usize = 0;
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
