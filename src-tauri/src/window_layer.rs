@@ -420,9 +420,14 @@ pub mod mouse_hook {
     ) -> LRESULT {
         if msg == WM_MOUSELEAVE {
             if EXPLICIT_MOUSELEAVE.swap(false, Ordering::Relaxed) {
-                // Our hook sent this — let it through to Chromium
+                log::info!("[SUBCLASS] WM_MOUSELEAVE — FORWARDED (explicit from hook)");
             } else {
-                // Spurious from TrackMouseEvent — suppress
+                // Count suppressed leaves (sampled log to avoid spam)
+                static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n % 200 == 0 {
+                    log::info!("[SUBCLASS] WM_MOUSELEAVE — SUPPRESSED (#{}, spurious TrackMouseEvent)", n);
+                }
                 return LRESULT(0);
             }
         }
@@ -583,6 +588,7 @@ pub mod mouse_hook {
                                     // Set flag so our subclass lets this WM_MOUSELEAVE through
                                     EXPLICIT_MOUSELEAVE.store(true, Ordering::Relaxed);
                                     let _ = PostMessageW(cw, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+                                    log::info!("[HOOK] cursor left desktop → sent explicit WM_MOUSELEAVE");
                                 }
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -600,14 +606,19 @@ pub mod mouse_hook {
                         if is_down && state == STATE_IDLE {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 state = STATE_NATIVE;
+                                log::info!("[HOOK] state IDLE→NATIVE (click on icon) pt=({},{})", pt.x, pt.y);
                             } else {
                                 state = STATE_WEB;
+                                log::info!("[HOOK] state IDLE→WEB (click on desktop) pt=({},{})", pt.x, pt.y);
                             }
                             HOOK_STATE.store(state, Ordering::SeqCst);
                         }
 
                         if state == STATE_NATIVE {
-                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
+                            if is_up {
+                                HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst);
+                                log::info!("[HOOK] state NATIVE→IDLE (mouseup)");
+                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
@@ -639,27 +650,37 @@ pub mod mouse_hook {
                             // WM_MOUSEWHEEL is the exception — it uses screen coords.
                             use windows::Win32::Graphics::Gdi::ScreenToClient;
                             let mut client_pt = pt;
-                            let _ = ScreenToClient(cw, &mut client_pt);
+                            let stc_ok = ScreenToClient(cw, &mut client_pt);
                             let lparam_client = LPARAM(((client_pt.y as u16 as u32) << 16 | (client_pt.x as u16 as u32)) as isize);
                             let lparam_screen = LPARAM(((pt.y as u16 as u32) << 16 | (pt.x as u16 as u32)) as isize);
 
+                            // Sampled move log (every 200), all other events logged
+                            static POST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            let n = POST_COUNT.fetch_add(1, Ordering::Relaxed);
+
                             match msg {
                                 WM_MOUSEMOVE => {
-                                    // During drag, include MK_* flag so Chromium tracks the drag
                                     let mk = DRAG_BUTTON_MK.load(Ordering::Relaxed) as usize;
                                     let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_client);
+                                    if n < 3 || n % 200 == 0 {
+                                        log::info!("[POST] #{} WM_MOUSEMOVE screen=({},{}) client=({},{}) stc={} mk={} state={}",
+                                            n, pt.x, pt.y, client_pt.x, client_pt.y, stc_ok.as_bool(), mk, state);
+                                    }
                                 }
                                 WM_LBUTTONDOWN => {
                                     DRAG_BUTTON_MK.store(MK_LBUTTON as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lparam_client);
+                                    let r = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lparam_client);
+                                    log::info!("[POST] WM_LBUTTONDOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
                                 }
                                 WM_LBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_client);
+                                    let r = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_client);
+                                    log::info!("[POST] WM_LBUTTONUP screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
                                 }
                                 WM_RBUTTONDOWN => {
                                     DRAG_BUTTON_MK.store(MK_RBUTTON as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON), lparam_client);
+                                    let r = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON), lparam_client);
+                                    log::info!("[POST] WM_RBUTTONDOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
                                 }
                                 WM_RBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
@@ -674,12 +695,16 @@ pub mod mouse_hook {
                                     let _ = PostMessageW(cw, WM_MBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                    // Wheel: wparam high word = delta, lparam = SCREEN coords (Win32 convention)
-                                    let delta = info.mouseData & 0xFFFF0000; // high word already positioned
-                                    let _ = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_screen);
+                                    let delta = info.mouseData & 0xFFFF0000;
+                                    let delta_val = (info.mouseData >> 16) as i16;
+                                    let r = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_screen);
+                                    log::info!("[POST] WM_MOUSEWHEEL delta={} screen=({},{}) ok={} horiz={}",
+                                        delta_val, pt.x, pt.y, r.is_ok(), msg == WM_MOUSEHWHEEL);
                                 }
                                 _ => {}
                             }
+                        } else if msg != WM_MOUSEMOVE {
+                            log::warn!("[HOOK] Chrome widget HWND=0 — cannot forward msg=0x{:X}", msg);
                         }
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
