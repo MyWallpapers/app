@@ -334,6 +334,8 @@ pub mod mouse_hook {
 
     /// Debug: sampled move counter for diagnostic logging
     static MOVE_DEBUG_COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// Debug: log first unknown window encounter
+    static UNKNOWN_HWND_LOGGED: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -429,12 +431,20 @@ pub mod mouse_hook {
 
                         // Détection d'overlay système (Win11 Widgets/Copilot/Search)
                         // Ces fenêtres sont transparentes visuellement mais bloquent WindowFromPoint.
-                        // On les identifie par : WS_EX_NOACTIVATE + process différent d'Explorer
+                        // On les identifie par : styles d'overlay + process différent d'Explorer
+                        // + la fenêtre n'est PAS au premier plan (exclut les vraies apps)
                         if !is_over_desktop {
                             let root = GetAncestor(hwnd_under, GA_ROOT);
-                            if !root.is_invalid() {
+                            let fg = GetForegroundWindow();
+
+                            // Si la fenêtre (ou sa racine) est au premier plan, c'est une vraie app
+                            if root != fg && hwnd_under != fg && !root.is_invalid() {
                                 let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
-                                if (ex & WS_EX_NOACTIVATE.0) != 0 {
+                                let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
+                                    || (ex & WS_EX_TOOLWINDOW.0) != 0
+                                    || ((ex & WS_EX_LAYERED.0) != 0 && (ex & WS_EX_APPWINDOW.0) == 0);
+
+                                if is_overlay_style {
                                     let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
                                     let mut overlay_pid = 0u32;
                                     GetWindowThreadProcessId(root, Some(&mut overlay_pid));
@@ -442,6 +452,29 @@ pub mod mouse_hook {
                                         is_over_desktop = true;
                                     }
                                 }
+                            }
+
+                            // Diagnostic : log détaillé du premier hwnd inconnu qui échappe à la détection
+                            if !is_over_desktop && !UNKNOWN_HWND_LOGGED.swap(true, Ordering::Relaxed) {
+                                let ex = if !root.is_invalid() { GetWindowLongW(root, GWL_EXSTYLE) as u32 } else { 0 };
+                                let mut overlay_pid = 0u32;
+                                if !root.is_invalid() { GetWindowThreadProcessId(root, Some(&mut overlay_pid)); }
+                                let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
+                                let mut root_cn = [0u16; 256];
+                                let root_len = if !root.is_invalid() { GetClassNameW(root, &mut root_cn) } else { 0 };
+                                let root_class = String::from_utf16_lossy(&root_cn[..root_len as usize]);
+                                let mut cn = [0u16; 256];
+                                let cn_len = GetClassNameW(hwnd_under, &mut cn);
+                                let under_class = String::from_utf16_lossy(&cn[..cn_len as usize]);
+                                log::info!("[MOUSE] UNDETECTED hwnd=0x{:X} class='{}' root=0x{:X} root_class='{}' ex=0x{:X} noact={} tool={} layered={} appwin={} pid={} explorer_pid={} fg=0x{:X}",
+                                    hwnd_under.0 as isize, under_class,
+                                    root.0 as isize, root_class, ex,
+                                    (ex & WS_EX_NOACTIVATE.0) != 0,
+                                    (ex & WS_EX_TOOLWINDOW.0) != 0,
+                                    (ex & WS_EX_LAYERED.0) != 0,
+                                    (ex & WS_EX_APPWINDOW.0) != 0,
+                                    overlay_pid, explorer_pid,
+                                    fg.0 as isize);
                             }
                         }
 
@@ -555,11 +588,14 @@ pub mod mouse_hook {
                         }
 
                         // 4. INJECTION DIRECTE
+                        // WM_MOUSEWHEEL: poster au WebView parent (Chromium route depuis le parent)
+                        // Autres messages: poster au Chrome_RenderWidgetHostHWND directement
+                        let post_target = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL { wv } else { target };
                         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            log::info!("[MOUSE] wheel fwd → target=0x{:X} wp=0x{:X} lp=0x{:X}",
-                                target.0 as isize, wp, lp);
+                            log::info!("[MOUSE] wheel fwd → wv=0x{:X} wp=0x{:X} lp=0x{:X}",
+                                wv.0 as isize, wp, lp);
                         }
-                        let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
+                        let _ = PostMessageW(post_target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
