@@ -321,8 +321,11 @@ pub mod mouse_hook {
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
-    // WM_MOUSELEAVE n'est pas dans WindowsAndMessaging — défini manuellement
+    // Constants not re-exported by WindowsAndMessaging — define manually
     const WM_MOUSELEAVE: u32 = 0x02A3;
+    const MK_LBUTTON: usize = 0x0001;
+    const MK_RBUTTON: usize = 0x0002;
+    const MK_MBUTTON: usize = 0x0010;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -368,7 +371,7 @@ pub mod mouse_hook {
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
     fn get_chrome_widget_hwnd() -> isize { CHROME_WIDGET_HWND.load(Ordering::SeqCst) }
-    fn set_chrome_widget_hwnd(hwnd: isize) { CHROME_WIDGET_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_chrome_widget_hwnd(hwnd: isize) { CHROME_WIDGET_HWND.store(hwnd, Ordering::SeqCst); }
 
     /// Finds Chrome_RenderWidgetHostHWND inside the WebView2 HWND hierarchy.
     /// This is Chromium's internal input HWND — PostMessage to it goes through
@@ -601,24 +604,24 @@ pub mod mouse_hook {
                                     let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_client);
                                 }
                                 WM_LBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_LBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON.0 as usize), lparam_client);
+                                    DRAG_BUTTON_MK.store(MK_LBUTTON as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lparam_client);
                                 }
                                 WM_LBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
                                     let _ = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_RBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_RBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON.0 as usize), lparam_client);
+                                    DRAG_BUTTON_MK.store(MK_RBUTTON as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON), lparam_client);
                                 }
                                 WM_RBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
                                     let _ = PostMessageW(cw, WM_RBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_MBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_MBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON.0 as usize), lparam_client);
+                                    DRAG_BUTTON_MK.store(MK_MBUTTON as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON), lparam_client);
                                 }
                                 WM_MBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
