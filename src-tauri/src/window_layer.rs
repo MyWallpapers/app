@@ -341,8 +341,6 @@ pub mod mouse_hook {
     /// MK_* flag of the button that initiated the current drag (used for WM_MOUSEMOVE wparam)
     static DRAG_BUTTON_MK: AtomicU16 = AtomicU16::new(0);
 
-    /// Original WndProc of Chrome_RenderWidgetHostHWND (for subclass chain)
-    static ORIGINAL_CHROME_WNDPROC: AtomicIsize = AtomicIsize::new(0);
     /// When true, the next WM_MOUSELEAVE is from our hook (let it through).
     /// When false, WM_MOUSELEAVE is spurious from TrackMouseEvent (suppress it).
     static EXPLICIT_MOUSELEAVE: AtomicBool = AtomicBool::new(false);
@@ -405,45 +403,52 @@ pub mod mouse_hook {
         if data.found.is_invalid() { None } else { Some(data.found) }
     }
 
-    /// Subclass proc for Chrome_RenderWidgetHostHWND.
-    /// Suppresses spurious WM_MOUSELEAVE from Windows TrackMouseEvent.
+    /// WH_GETMESSAGE hook on Chromium's UI thread.
+    /// Intercepts messages BEFORE they're dispatched to Chrome_RenderWidgetHostHWND.
     ///
     /// Problem: After each WM_MOUSEMOVE we PostMessage, Chromium calls
     /// TrackMouseEvent(TME_LEAVE). Windows checks the REAL cursor position —
     /// it's over SHELLDLL_DefView (not Chrome), so Windows immediately posts
     /// WM_MOUSELEAVE. This kills CSS :hover and scroll.
     ///
-    /// Fix: Block WM_MOUSELEAVE unless our hook explicitly sent it
-    /// (via EXPLICIT_MOUSELEAVE flag when cursor leaves desktop area).
-    unsafe extern "system" fn chrome_subclass_proc(
-        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    /// Fix: Thread-specific WH_GETMESSAGE hook intercepts WM_MOUSELEAVE
+    /// and replaces it with WM_NULL (harmless) unless our hook explicitly sent it.
+    /// Unlike SetWindowLongPtrW(GWLP_WNDPROC), this works cross-thread.
+    unsafe extern "system" fn chrome_getmsg_hook_proc(
+        code: i32, wparam: WPARAM, lparam: LPARAM,
     ) -> LRESULT {
-        if msg == WM_MOUSELEAVE {
-            if EXPLICIT_MOUSELEAVE.swap(false, Ordering::Relaxed) {
-                log::info!("[SUBCLASS] WM_MOUSELEAVE — FORWARDED (explicit from hook)");
-            } else {
-                // Count suppressed leaves (sampled log to avoid spam)
-                static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-                if n < 5 || n % 200 == 0 {
-                    log::info!("[SUBCLASS] WM_MOUSELEAVE — SUPPRESSED (#{}, spurious TrackMouseEvent)", n);
+        if code >= 0 {
+            let msg = &mut *(lparam.0 as *mut MSG);
+            let cw_raw = get_chrome_widget_hwnd();
+            if msg.message == WM_MOUSELEAVE && msg.hwnd.0 as isize == cw_raw {
+                if EXPLICIT_MOUSELEAVE.swap(false, Ordering::Relaxed) {
+                    log::info!("[GETMSG] WM_MOUSELEAVE → FORWARDED (explicit from hook)");
+                } else {
+                    // Suppress: replace with harmless WM_NULL
+                    msg.message = WM_NULL;
+                    static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                    if n < 5 || n % 200 == 0 {
+                        log::info!("[GETMSG] WM_MOUSELEAVE → SUPPRESSED #{} (spurious TrackMouseEvent)", n);
+                    }
                 }
-                return LRESULT(0);
             }
         }
-        let orig: WNDPROC = std::mem::transmute(ORIGINAL_CHROME_WNDPROC.load(Ordering::SeqCst));
-        CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
     }
 
-    /// Installs our subclass on Chrome_RenderWidgetHostHWND to suppress
-    /// spurious WM_MOUSELEAVE messages.
-    unsafe fn install_chrome_subclass(cw: HWND) {
-        let orig = SetWindowLongPtrW(cw, WINDOW_LONG_PTR_INDEX(-4), chrome_subclass_proc as isize);
-        if orig != 0 {
-            ORIGINAL_CHROME_WNDPROC.store(orig, Ordering::SeqCst);
-            log::info!("Chrome_RenderWidgetHostHWND subclassed (suppress spurious WM_MOUSELEAVE)");
-        } else {
-            log::warn!("Failed to subclass Chrome_RenderWidgetHostHWND — hover may not work");
+    /// Installs WH_GETMESSAGE hook on Chromium's UI thread to suppress
+    /// spurious WM_MOUSELEAVE. Works cross-thread (unlike SetWindowLongPtrW).
+    unsafe fn install_chrome_msg_hook(cw: HWND) {
+        let chrome_tid = GetWindowThreadProcessId(cw, None);
+        if chrome_tid == 0 {
+            log::warn!("Failed to get Chrome HWND thread ID — hover suppression disabled");
+            return;
+        }
+        let hook = SetWindowsHookExW(WH_GETMESSAGE, Some(chrome_getmsg_hook_proc), None, chrome_tid);
+        match hook {
+            Ok(h) => log::info!("WH_GETMESSAGE hook installed on Chrome thread {} (suppress WM_MOUSELEAVE) hook={:?}", chrome_tid, h),
+            Err(e) => log::warn!("Failed to install WH_GETMESSAGE hook on Chrome thread {}: {}", chrome_tid, e),
         }
     }
 
@@ -457,7 +462,7 @@ pub mod mouse_hook {
                 if let Some(cw) = discover_chrome_widget(wv) {
                     set_chrome_widget_hwnd(cw.0 as isize);
                     log::info!("Chrome_RenderWidgetHostHWND discovered: 0x{:X}", cw.0 as isize);
-                    unsafe { install_chrome_subclass(cw); }
+                    unsafe { install_chrome_msg_hook(cw); }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
