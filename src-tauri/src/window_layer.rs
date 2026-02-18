@@ -234,7 +234,7 @@ pub mod mouse_hook {
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
-    static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0); // Le CACHE de performance
+    static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
 
     static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
     const STATE_IDLE: u8 = 0;
@@ -246,7 +246,6 @@ pub mod mouse_hook {
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
 
-    // ATTENTION: Cette fonction coûte cher en CPU. Elle ne doit être appelée QU'AU CLIC, jamais sur le mouvement.
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
         use windows::core::VARIANT;
@@ -259,7 +258,7 @@ pub mod mouse_hook {
             if let Some(acc) = p_acc {
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
                     if let Ok(role_val) = i32::try_from(&role_var) {
-                        return role_val == 34; // 34 = ROLE_SYSTEM_LISTITEM (Icône native)
+                        return role_val == 34; // 34 = ROLE_SYSTEM_LISTITEM
                     }
                 }
             }
@@ -272,7 +271,6 @@ pub mod mouse_hook {
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                // Indispensable pour que Windows ne fausse pas les coordonnées sur les écrans avec zoom (ex: 150%)
                 let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             }
 
@@ -290,7 +288,7 @@ pub mod mouse_hook {
                         let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
-                        // 1. MACHINE À ÉTATS (On ne scanne les icônes qu'au premier appui)
+                        // 1. MACHINE À ÉTATS (Bloque le focus sur les icônes de bureau)
                         if is_down && state == STATE_IDLE {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 state = STATE_NATIVE;
@@ -300,13 +298,12 @@ pub mod mouse_hook {
                             HOOK_STATE.store(state, Ordering::SeqCst);
                         }
 
-                        // 2. LAISSER-PASSER NATIF (Glisser-déposer des icônes de bureau)
                         if state == STATE_NATIVE {
                             if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // 3. CACHE O(1) DU MOTEUR CHROMIUM (Supprime le CPU Spike)
+                        // 2. CORRECTION DU CACHE EMPOISONNÉ
                         let mut target = HWND(RENDER_WIDGET_HWND.load(Ordering::Relaxed) as *mut _);
                         if target.is_invalid() || !IsWindow(target).as_bool() {
                             struct S { res: HWND }
@@ -321,19 +318,29 @@ pub mod mouse_hook {
                                 BOOL(1)
                             }
                             let _ = EnumChildWindows(wv, Some(cb), LPARAM(&mut s as *mut _ as isize));
-                            target = if !s.res.is_invalid() { s.res } else { wv };
-                            RENDER_WIDGET_HWND.store(target.0 as isize, Ordering::Relaxed);
+                            
+                            if !s.res.is_invalid() {
+                                // Moteur trouvé ! On le met en cache définitivement.
+                                target = s.res;
+                                RENDER_WIDGET_HWND.store(target.0 as isize, Ordering::Relaxed);
+                            } else {
+                                // Moteur pas encore prêt (App en cours de lancement). 
+                                // On utilise wv comme fallback, MAIS ON NE LE MET SURTOUT PAS EN CACHE !
+                                target = wv; 
+                            }
                         }
 
-                        // 4. COORDONNÉES ABSOLUMENT PRÉCISES (Calculées sur le WebEngine)
+                        // 3. PACKING PARFAIT DES COORDONNÉES
                         let mut client_pt = pt;
                         let _ = ScreenToClient(target, &mut client_pt);
-                        let lp = ((client_pt.y as u16 as isize) << 16) | (client_pt.x as u16 as isize);
+                        
+                        // Sécurité mathématique: on force l'alignement sur 16 bits même avec des coordonnées négatives
+                        let lp = (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize;
 
-                        // 5. MAPPING DES DRAPEAUX DE SOURIS (Répare le hover et le clic droit)
+                        // 4. CORRECTION DES DRAPEAUX ET DE LA MOLETTE
                         let mut wp: usize = 0;
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
-                            wp |= 0x0001; // MK_LBUTTON (Maintenu si on drag sur le web)
+                            wp |= 0x0001; // MK_LBUTTON
                         }
                         if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
                             wp |= 0x0002; // MK_RBUTTON
@@ -342,17 +349,16 @@ pub mod mouse_hook {
                             wp |= 0x0010; // MK_MBUTTON
                         }
                         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            wp = (info.mouseData >> 16) as u16 as usize; // Garde la direction de la molette
+                            // On restaure les bits de direction intacts !
+                            wp = (info.mouseData & 0xFFFF0000) as usize; 
                         }
 
-                        // 6. TUNNEL D'INJECTION WEB
+                        // 5. ENVOI AU WEB
                         let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        // 7. BLOCAGE SYSTÈME SÉLECTIF
-                        // On doit laisser passer le MouseMove sinon le curseur physique de Windows fige.
-                        // Les clics, par contre, sont volés par le Hook.
+                        // On bloque l'événement physique si ce n'est pas un mouvement.
                         if msg != WM_MOUSEMOVE {
                             return LRESULT(1);
                         }
