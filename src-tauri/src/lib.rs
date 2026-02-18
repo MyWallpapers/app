@@ -7,7 +7,7 @@ mod commands_core;
 mod tray;
 mod window_layer;
 
-use tracing::info;
+use log::{info, warn, error, debug};
 
 fn mw_init_script() -> String {
     format!(

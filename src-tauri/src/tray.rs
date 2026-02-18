@@ -6,7 +6,7 @@ use tauri::{
     tray::{TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
-use tracing::{debug, info};
+use log::{debug, info};
 
 /// Setup the system tray with icon and quit menu
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {

@@ -5,7 +5,7 @@
 //!          Native icons (ROLE_SYSTEM_LISTITEM) are ignored and process clicks natively.
 //! macOS: kCGDesktopWindowLevel set behind desktop icons. Native icon hiding via Finder defaults.
 
-use tracing::{info, warn};
+use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Flag de sécurité pour ne pas spammer le système à la fermeture
