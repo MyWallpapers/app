@@ -224,7 +224,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -238,6 +238,9 @@ pub mod mouse_hook {
     const STATE_IDLE: u8 = 0;
     const STATE_NATIVE: u8 = 1;
     const STATE_WEB: u8 = 2;
+
+    /// Tracks whether cursor was over desktop on previous move (for WM_MOUSELEAVE)
+    static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -293,7 +296,22 @@ pub mod mouse_hook {
 
                         // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
                         if state == STATE_IDLE && !is_over_desktop {
+                            // Transition desktop → hors-desktop : envoyer WM_MOUSELEAVE pour reset les :hover CSS
+                            if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
+                                let cached = RENDER_WIDGET_HWND.load(Ordering::Relaxed);
+                                if cached != 0 {
+                                    let target = HWND(cached as *mut _);
+                                    if IsWindow(target).as_bool() {
+                                        let _ = PostMessageW(target, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+                                    }
+                                }
+                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                        }
+
+                        // Track la présence sur le desktop pour détecter la sortie
+                        if msg == WM_MOUSEMOVE {
+                            WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
                         let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
