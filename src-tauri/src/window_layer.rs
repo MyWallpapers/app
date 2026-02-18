@@ -536,9 +536,10 @@ pub mod mouse_hook {
                             use tauri::Emitter;
 
                             let should_emit = if msg == WM_MOUSEMOVE {
-                                // Throttle mousemove to ~60fps (16ms) using GetTickCount64
+                                // Throttle mousemove to ~60fps (16ms)
+                                use std::time::{SystemTime, UNIX_EPOCH};
                                 static LAST_MOVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                let now_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+                                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                                 let prev = LAST_MOVE_MS.load(Ordering::Relaxed);
                                 if now_ms.wrapping_sub(prev) >= 16 {
                                     LAST_MOVE_MS.store(now_ms, Ordering::Relaxed);
