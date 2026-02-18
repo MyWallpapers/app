@@ -118,11 +118,10 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
 
+        // 1. Demande de scission du bureau
         let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
-
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
         struct Found {
             worker_w: HWND,
@@ -140,18 +139,28 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                     if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
                         if !w.is_invalid() {
                             found.worker_w = w;
-                            return BOOL(0);
+                            return BOOL(0); // On a trouvé, on arrête l'énumération
                         }
                     }
                 }
             }
-            BOOL(1)
+            BOOL(1) // Continuer la recherche
         }
 
-        let _ = EnumWindows(Some(callback), LPARAM(&mut found as *mut Found as isize));
+        // 2. MÉTHODE PROPRE : Polling (Boucle de tentative) 
+        // On vérifie jusqu'à 10 fois toutes les 50ms pour laisser Windows travailler
+        let mut attempts = 0;
+        while attempts < 10 {
+            let _ = EnumWindows(Some(callback), LPARAM(&mut found as *mut Found as isize));
+            if !found.worker_w.is_invalid() {
+                break; // Trouvé ! On sort de la boucle immédiatement.
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            attempts += 1;
+        }
 
         if found.worker_w.is_invalid() {
-            return Err("Could not find WorkerW".to_string());
+            return Err("WorkerW n'a pas pu être généré par Windows dans les temps.".to_string());
         }
 
         mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
@@ -160,13 +169,28 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
 
         let current_parent = GetParent(our_hwnd);
-        // Correction Windows 0.58: GetParent renvoie un Result<HWND>
         if current_parent != Ok(found.worker_w) {
+            
+            // On s'assure que la fenêtre agit comme un fond d'écran (Win11)
+            let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
+            style &= !(WS_POPUP.0 as i32); 
+            style |= WS_CHILD.0 as i32;    
+            let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
+
+            // 3. Injection derrière les icônes
             let _ = SetParent(our_hwnd, found.worker_w);
-            let mut rect = windows::Win32::Foundation::RECT::default();
-            let _ = GetClientRect(found.worker_w, &mut rect);
-            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, rect.right, rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            info!("Injected into WorkerW ({}x{})", rect.right, rect.bottom);
+            
+            // MÉTHODE PROPRE : SWP_NOSIZE | SWP_NOMOVE
+            // On fait confiance aux calculs de taille faits par Tauri dans `src/lib.rs`.
+            // On ne tente plus de lire la taille erratique du WorkerW.
+            let _ = SetWindowPos(
+                our_hwnd, 
+                HWND::default(), 
+                0, 0, 0, 0, 
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE
+            );
+            
+            info!("Injected into WorkerW successfully");
         }
     }
 
