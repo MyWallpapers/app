@@ -70,7 +70,7 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
 pub fn restore_desktop_icons() {
     // Si on l'a déjà fait, on annule pour éviter le double "killall Finder"
     if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
-        return; 
+        return;
     }
 
     #[cfg(target_os = "windows")]
@@ -90,7 +90,6 @@ pub fn restore_desktop_icons() {
 
     #[cfg(target_os = "macos")]
     {
-        // Sur macOS, on s'assure que le Finder réaffiche les icônes
         let _ = std::process::Command::new("defaults")
             .args(["write", "com.apple.finder", "CreateDesktop", "true"])
             .output();
@@ -102,45 +101,52 @@ pub fn restore_desktop_icons() {
 }
 
 // ============================================================================
-// Windows: WorkerW Injection & Mouse Hook
+// Windows: Desktop Detection, Injection & Recovery
 // ============================================================================
 
+/// Résultat de la détection de la hiérarchie desktop Windows
 #[cfg(target_os = "windows")]
-fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+struct DesktopDetection {
+    is_24h2: bool,
+    target_parent: windows::Win32::Foundation::HWND,
+    shell_view: windows::Win32::Foundation::HWND,
+    os_workerw: windows::Win32::Foundation::HWND,
+    syslistview: windows::Win32::Foundation::HWND,
+}
+
+/// Détecte l'architecture desktop Windows (24H2 ou Legacy) et retourne tous les HWNDs
+#[cfg(target_os = "windows")]
+fn detect_desktop() -> Result<DesktopDetection, String> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
-
-    let our_hwnd = window.hwnd().map_err(|e| format!("Failed to get HWND: {}", e))?;
-    let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
 
-        // 1. On réveille le bureau (Action requise pour toutes les versions de Windows)
+        // Réveiller le bureau (spawn WorkerW si nécessaire)
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
-        // Variables pour mémoriser l'architecture détectée
         let mut is_24h2 = false;
         let mut target_parent = HWND::default();
         let mut shell_view = HWND::default();
-        let mut os_workerw = HWND::default(); // Uniquement pour la 24H2
+        let mut os_workerw = HWND::default();
 
-        // 2. BOUCLE DE DÉTECTION INTELLIGENTE (Attente max de 2 secondes)
+        // Boucle de détection (max 2 secondes)
         for _ in 0..40 {
-            // TEST A : Architecture Windows 11 24H2+ (Icônes et WorkerW enfermés dans Progman)
+            // TEST A : Architecture Windows 11 24H2+ (Icônes et WorkerW dans Progman)
             let sv_prog = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or(HWND::default());
             let ww_prog = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or(HWND::default());
-            
+
             if !sv_prog.is_invalid() && !ww_prog.is_invalid() {
                 is_24h2 = true;
                 target_parent = progman;
                 shell_view = sv_prog;
                 os_workerw = ww_prog;
-                break; // Détection 24H2 réussie !
+                break;
             }
 
             // TEST B : Architecture Legacy (Windows 10 / 11 anciens)
@@ -149,14 +155,12 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                 shell_view: HWND,
             }
             let mut l_data = LegacyData { empty_workerw: HWND::default(), shell_view: HWND::default() };
-            
+
             unsafe extern "system" fn legacy_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 let d = &mut *(lparam.0 as *mut LegacyData);
-                // On cherche la fenêtre qui possède les icônes
                 if let Ok(shell) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
                     if !shell.is_invalid() {
                         d.shell_view = shell;
-                        // Dans l'ancien système, le bureau vide est le frère jumeau directement suivant
                         if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
                             if !w.is_invalid() { d.empty_workerw = w; }
                         }
@@ -165,64 +169,142 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                 }
                 BOOL(1)
             }
-            
+
             let _ = EnumWindows(Some(legacy_cb), LPARAM(&mut l_data as *mut LegacyData as isize));
             if !l_data.empty_workerw.is_invalid() && !l_data.shell_view.is_invalid() {
                 is_24h2 = false;
                 target_parent = l_data.empty_workerw;
                 shell_view = l_data.shell_view;
-                break; // Détection Legacy réussie !
+                break;
             }
 
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Si après 2 secondes, aucune architecture n'a répondu
         if target_parent.is_invalid() {
-            return Err("Impossible de s'injecter : Ni l'architecture Windows 11 24H2, ni la Legacy n'ont pu être construites.".to_string());
+            return Err("Desktop detection failed: neither 24H2 nor Legacy architecture found.".to_string());
         }
 
-        // Configuration du Hook de la souris — on enregistre TOUS les HWND de la hiérarchie desktop
-        mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
-        mouse_hook::set_shell_view_hwnd(shell_view.0 as isize);
-        mouse_hook::set_target_parent_hwnd(target_parent.0 as isize);
+        // Trouver SysListView32
+        let mut syslistview = HWND::default();
         if let Ok(slv) = FindWindowExW(shell_view, HWND::default(), windows::core::w!("SysListView32"), None) {
             if !slv.is_invalid() {
-                mouse_hook::set_syslistview_hwnd(slv.0 as isize);
+                syslistview = slv;
             }
         }
 
-        // 3. INJECTION SELON L'ARCHITECTURE DE L'OS
-        let current_parent = GetParent(our_hwnd);
-        if current_parent != Ok(target_parent) {
-            
-            // Règle d'or de DWM : Toute fenêtre injectée doit devenir un "Enfant"
-            let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
-            style &= !(WS_POPUP.0 as i32); 
-            style |= WS_CHILD.0 as i32;    
-            let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
+        Ok(DesktopDetection { is_24h2, target_parent, shell_view, os_workerw, syslistview })
+    }
+}
 
-            // On s'injecte dans le parent cible défini par notre moteur de détection
-            let _ = SetParent(our_hwnd, target_parent);
+/// Injecte notre WebView dans la hiérarchie desktop avec le bon Z-order
+#[cfg(target_os = "windows")]
+fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::*;
 
-            if is_24h2 {
-                log::info!("Moteur Windows 11 24H2 activé.");
-                // Z-Order chirurgical dans Progman : Sous les icônes (shell_view), mais SUR le vieux WorkerW
-                let _ = SetWindowPos(our_hwnd, shell_view, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
-                let _ = SetWindowPos(os_workerw, our_hwnd, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
-            } else {
-                log::info!("Moteur Windows Legacy activé.");
-                // Injection classique dans un espace vide, pas de Z-Order complexe
-                let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
-            }
-            
-            log::info!("Injected native Webview successfully.");
+    unsafe {
+        // Si déjà injecté dans le bon parent, ne rien faire
+        if GetParent(our_hwnd) == Ok(detection.target_parent) {
+            return;
+        }
+
+        // Règle d'or de DWM : Toute fenêtre injectée doit devenir un "Enfant"
+        let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
+        style &= !(WS_POPUP.0 as i32);
+        style |= WS_CHILD.0 as i32;
+        let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
+
+        let _ = SetParent(our_hwnd, detection.target_parent);
+
+        if detection.is_24h2 {
+            // Z-Order chirurgical dans Progman : Sous les icônes, SUR le vieux WorkerW
+            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+            let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
+        } else {
+            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+
+    let our_hwnd = window.hwnd().map_err(|e| format!("Failed to get HWND: {}", e))?;
+    let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
+
+    let detection = detect_desktop()?;
+
+    // Enregistrer tous les HWNDs de la hiérarchie desktop pour le mouse hook
+    mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
+    mouse_hook::set_shell_view_hwnd(detection.shell_view.0 as isize);
+    mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
+    if !detection.syslistview.is_invalid() {
+        mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
+    }
+
+    apply_injection(our_hwnd, &detection);
+
+    if detection.is_24h2 {
+        info!("Moteur Windows 11 24H2 activé.");
+    } else {
+        info!("Moteur Windows Legacy activé.");
+    }
+    info!("Injected native Webview successfully.");
 
     mouse_hook::start_hook_thread();
     Ok(())
 }
+
+/// Tente de récupérer l'injection après un redémarrage d'Explorer
+#[cfg(target_os = "windows")]
+pub fn try_refresh_desktop() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    let wv_hwnd = mouse_hook::get_webview_hwnd();
+    if wv_hwnd == 0 { return false; }
+    let our_hwnd = HWND(wv_hwnd as *mut core::ffi::c_void);
+
+    // Vérifier que notre WebView existe encore (sinon l'app doit redémarrer)
+    unsafe {
+        if !IsWindow(our_hwnd).as_bool() {
+            warn!("WebView HWND destroyed — cannot recover.");
+            return false;
+        }
+    }
+
+    match detect_desktop() {
+        Ok(detection) => {
+            // Mettre à jour les handles atomiques
+            mouse_hook::set_shell_view_hwnd(detection.shell_view.0 as isize);
+            mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
+            if !detection.syslistview.is_invalid() {
+                mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
+            }
+            mouse_hook::invalidate_render_cache();
+
+            // Ré-injecter dans la nouvelle hiérarchie
+            apply_injection(our_hwnd, &detection);
+
+            if detection.is_24h2 {
+                info!("Desktop recovered (24H2).");
+            } else {
+                info!("Desktop recovered (Legacy).");
+            }
+            true
+        }
+        Err(e) => {
+            warn!("Desktop recovery failed: {}", e);
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Windows: Mouse Hook
+// ============================================================================
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
@@ -231,6 +313,9 @@ pub mod mouse_hook {
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+
+    // WM_MOUSELEAVE n'est pas dans WindowsAndMessaging — défini manuellement
+    const WM_MOUSELEAVE: u32 = 0x02A3;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -252,6 +337,31 @@ pub mod mouse_hook {
     pub fn set_target_parent_hwnd(hwnd: isize) { TARGET_PARENT_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
+
+    /// Invalide le cache de Chrome_RenderWidgetHostHWND (après recovery)
+    pub fn invalidate_render_cache() {
+        RENDER_WIDGET_HWND.store(0, Ordering::SeqCst);
+    }
+
+    /// Vérifie que tous les HWNDs desktop sont encore valides (détecte un redémarrage d'Explorer)
+    pub fn validate_handles() -> bool {
+        let wv = WEBVIEW_HWND.load(Ordering::SeqCst);
+        if wv == 0 { return true; } // Pas encore initialisé
+
+        let slv = SYSLISTVIEW_HWND.load(Ordering::SeqCst);
+        let sv = SHELL_VIEW_HWND.load(Ordering::SeqCst);
+        let tp = TARGET_PARENT_HWND.load(Ordering::SeqCst);
+
+        unsafe {
+            // Notre WebView doit toujours exister
+            if !IsWindow(HWND(wv as *mut _)).as_bool() { return false; }
+            // Les handles desktop doivent être valides (si initialisés)
+            if slv != 0 && !IsWindow(HWND(slv as *mut _)).as_bool() { return false; }
+            if sv != 0 && !IsWindow(HWND(sv as *mut _)).as_bool() { return false; }
+            if tp != 0 && !IsWindow(HWND(tp as *mut _)).as_bool() { return false; }
+            true
+        }
+    }
 
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
@@ -290,7 +400,7 @@ pub mod mouse_hook {
                     let wv_hwnd = get_webview_hwnd();
                     if wv_hwnd != 0 {
                         let wv = HWND(wv_hwnd as *mut core::ffi::c_void);
-                        
+
                         // On identifie la fenêtre sous le curseur et on vérifie si elle fait partie
                         // de la hiérarchie desktop (Progman/WorkerW/SHELLDLL_DefView/SysListView32/WebView)
                         let hwnd_under = WindowFromPoint(pt);
@@ -304,7 +414,7 @@ pub mod mouse_hook {
                             || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
                             || IsChild(wv, hwnd_under).as_bool()   // Chrome_RenderWidgetHostHWND etc.
                             || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
-                        
+
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
                         // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
@@ -355,17 +465,17 @@ pub mod mouse_hook {
                                 let len = GetClassNameW(h, &mut n);
                                 if String::from_utf16_lossy(&n[..len as usize]).starts_with("Chrome_RenderWidgetHostHWND") {
                                     (*(l.0 as *mut S)).res = h;
-                                    return BOOL(0); 
+                                    return BOOL(0);
                                 }
                                 BOOL(1)
                             }
                             let _ = EnumChildWindows(wv, Some(cb), LPARAM(&mut s as *mut _ as isize));
-                            
+
                             if !s.res.is_invalid() {
                                 target = s.res;
                                 RENDER_WIDGET_HWND.store(target.0 as isize, Ordering::Relaxed);
                             } else {
-                                target = wv; 
+                                target = wv;
                             }
                         }
 
@@ -382,16 +492,16 @@ pub mod mouse_hook {
 
                         let mut wp: usize = 0;
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
-                            wp |= 0x0001; 
+                            wp |= 0x0001;
                         }
                         if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
-                            wp |= 0x0002; 
+                            wp |= 0x0002;
                         }
                         if msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP {
-                            wp |= 0x0010; 
+                            wp |= 0x0010;
                         }
                         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            wp = (info.mouseData & 0xFFFF0000) as usize; 
+                            wp = (info.mouseData & 0xFFFF0000) as usize;
                         }
 
                         // 4. INJECTION DIRECTE
@@ -429,7 +539,7 @@ pub mod visibility_watchdog {
     #[cfg(target_os = "windows")]
     pub fn start(app: AppHandle) {
         use tauri::Emitter;
-        
+
         std::thread::spawn(move || {
             use std::time::Duration;
             use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetDesktopWindow};
@@ -440,6 +550,17 @@ pub mod visibility_watchdog {
 
             loop {
                 std::thread::sleep(Duration::from_secs(2));
+
+                // Détection de stale HWNDs (redémarrage d'Explorer)
+                if !super::mouse_hook::validate_handles() {
+                    log::warn!("Desktop handles stale (Explorer restart?), attempting recovery...");
+                    if super::try_refresh_desktop() {
+                        log::info!("Desktop hierarchy recovered successfully.");
+                    } else {
+                        log::warn!("Desktop recovery failed — will retry next cycle.");
+                    }
+                    continue; // Skip visibility check this cycle
+                }
 
                 unsafe {
                     let fg_hwnd = GetForegroundWindow();
@@ -457,7 +578,7 @@ pub mod visibility_watchdog {
                     // --- RAFFINEMENT MULTI-ÉCRANS ---
                     // On récupère le moniteur de la fenêtre au premier plan
                     let hmonitor_fg = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTOPRIMARY);
-                    
+
                     // On récupère le moniteur de notre fond d'écran (via son HWND stocké)
                     let wv_hwnd = super::mouse_hook::get_webview_hwnd();
                     if wv_hwnd == 0 { continue; }
@@ -511,7 +632,7 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     // Dans Tauri 2, on récupère le pointeur NSWindow directement de manière sécurisée
     let ns_window = window.ns_window().map_err(|e| e.to_string())? as *mut objc::runtime::Object;
-    
+
     use objc::{msg_send, sel, sel_impl};
     unsafe {
         // kCGDesktopWindowLevel = -2147483623
