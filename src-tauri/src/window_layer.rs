@@ -285,8 +285,6 @@ pub fn try_refresh_desktop() -> bool {
             if !detection.syslistview.is_invalid() {
                 mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
             }
-            mouse_hook::invalidate_render_cache();
-
             // Ré-injecter dans la nouvelle hiérarchie
             apply_injection(our_hwnd, &detection);
 
@@ -313,7 +311,6 @@ pub mod mouse_hook {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
@@ -324,7 +321,6 @@ pub mod mouse_hook {
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SHELL_VIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
-    static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
     static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
 
     /// AppHandle pour émettre des événements Tauri (scroll via JS au lieu de PostMessage)
@@ -358,11 +354,6 @@ pub mod mouse_hook {
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
-
-    /// Invalide le cache de Chrome_RenderWidgetHostHWND (après recovery)
-    pub fn invalidate_render_cache() {
-        RENDER_WIDGET_HWND.store(0, Ordering::SeqCst);
-    }
 
     /// Vérifie que tous les HWNDs desktop sont encore valides (détecte un redémarrage d'Explorer)
     pub fn validate_handles() -> bool {
@@ -461,6 +452,19 @@ pub mod mouse_hook {
                             }
                         }
 
+                        // Fallback: walk parent chain — IsChild() may fail after SetParent injection
+                        if !is_over_desktop {
+                            let mut walk = hwnd_under;
+                            for _ in 0..5 {
+                                walk = GetAncestor(walk, GA_PARENT);
+                                if walk.is_invalid() || walk == tp { break; }
+                                if walk == wv {
+                                    is_over_desktop = true;
+                                    break;
+                                }
+                            }
+                        }
+
                         // Diagnostic logging (sampled: 1/500 moves, all wheel events)
                         if msg == WM_MOUSEMOVE {
                             let count = MOVE_DEBUG_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -487,12 +491,13 @@ pub mod mouse_hook {
                         if state == STATE_IDLE && !is_over_desktop {
                             // Transition desktop → hors-desktop : envoyer WM_MOUSELEAVE pour reset les :hover CSS
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
-                                let cached = RENDER_WIDGET_HWND.load(Ordering::Relaxed);
-                                if cached != 0 {
-                                    let target = HWND(cached as *mut _);
-                                    if IsWindow(target).as_bool() {
-                                        let _ = PostMessageW(target, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
-                                    }
+                                if let Some(handle) = APP_HANDLE.get() {
+                                    use tauri::Emitter;
+                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
+                                        "type": "mouseleave",
+                                        "x": pt.x, "y": pt.y,
+                                        "button": -1,
+                                    }));
                                 }
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -521,70 +526,48 @@ pub mod mouse_hook {
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // 2. LE CACHE PROPRE
-                        let mut target = HWND(RENDER_WIDGET_HWND.load(Ordering::Relaxed) as *mut _);
-                        if target.is_invalid() || !IsWindow(target).as_bool() || !IsChild(wv, target).as_bool() {
-                            struct S { res: HWND }
-                            let mut s = S { res: HWND::default() };
-                            unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
-                                let mut n = [0u16; 256];
-                                let len = GetClassNameW(h, &mut n);
-                                if String::from_utf16_lossy(&n[..len as usize]).starts_with("Chrome_RenderWidgetHostHWND") {
-                                    (*(l.0 as *mut S)).res = h;
-                                    return BOOL(0);
+                        // 2. EMIT TAURI EVENT — All desktop mouse interactions go through JS
+                        //    PostMessage to Chrome_RenderWidgetHostHWND had coordinate mapping issues.
+                        //    Tauri event → JS document.elementFromPoint() → synthetic DOM event.
+                        if let Some(handle) = APP_HANDLE.get() {
+                            use tauri::Emitter;
+
+                            match msg {
+                                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                                    let delta = (info.mouseData >> 16) as i16;
+                                    let horizontal = msg == WM_MOUSEHWHEEL;
+                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
+                                        "type": "wheel",
+                                        "x": pt.x, "y": pt.y,
+                                        "button": -1,
+                                        "deltaX": if horizontal { delta as i32 } else { 0 },
+                                        "deltaY": if horizontal { 0 } else { -(delta as i32) },
+                                    }));
                                 }
-                                BOOL(1)
+                                _ => {
+                                    let (event_type, btn) = match msg {
+                                        WM_MOUSEMOVE => ("mousemove", -1i32),
+                                        WM_LBUTTONDOWN => ("mousedown", 0),
+                                        WM_LBUTTONUP => ("mouseup", 0),
+                                        WM_RBUTTONDOWN => ("mousedown", 2),
+                                        WM_RBUTTONUP => ("mouseup", 2),
+                                        WM_MBUTTONDOWN => ("mousedown", 1),
+                                        WM_MBUTTONUP => ("mouseup", 1),
+                                        _ => ("unknown", -1),
+                                    };
+                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
+                                        "type": event_type,
+                                        "x": pt.x, "y": pt.y,
+                                        "button": btn,
+                                    }));
+                                }
                             }
-                            let _ = EnumChildWindows(wv, Some(cb), LPARAM(&mut s as *mut _ as isize));
-
-                            if !s.res.is_invalid() {
-                                target = s.res;
-                                RENDER_WIDGET_HWND.store(target.0 as isize, Ordering::Relaxed);
-                            } else {
-                                target = wv;
-                            }
                         }
-
-                        // 3. SCROLL → TAURI EVENT (PostMessage WM_MOUSEWHEEL ne fonctionne pas
-                        //    avec les browsers injectés — confirmé par recherche sur tous les projets OSS)
-                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            if let Some(handle) = APP_HANDLE.get() {
-                                use tauri::Emitter;
-                                let delta = (info.mouseData >> 16) as i16;
-                                let horizontal = msg == WM_MOUSEHWHEEL;
-                                let _ = handle.emit("desktop-scroll", serde_json::json!({
-                                    "deltaX": if horizontal { delta as i32 } else { 0 },
-                                    "deltaY": if horizontal { 0 } else { -(delta as i32) },
-                                    "x": pt.x, "y": pt.y
-                                }));
-                            }
-                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
-                            return LRESULT(1);
-                        }
-
-                        // 4. AUTRES MESSAGES → PostMessage vers Chrome_RenderWidgetHostHWND
-                        let mut client_pt = pt;
-                        let _ = ScreenToClient(target, &mut client_pt);
-                        let lp = (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize;
-
-                        let mut wp: usize = 0;
-                        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
-                            wp |= 0x0001;
-                        }
-                        if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
-                            wp |= 0x0002;
-                        }
-                        if msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP {
-                            wp |= 0x0010;
-                        }
-
-                        let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        // CONSUMER le message original pour empêcher Windows de le livrer à l'overlay.
-                        // Sans ça, Chrome reçoit WM_MOUSELEAVE (via TrackMouseEvent) car le système
-                        // voit le curseur sur l'overlay, pas sur Chrome → hover impossible.
+                        // CONSUMER le message pour empêcher Windows de le livrer à l'overlay.
+                        // Sans ça, Chrome reçoit WM_MOUSELEAVE (via TrackMouseEvent) → hover impossible.
                         return LRESULT(1);
                     }
                 }
