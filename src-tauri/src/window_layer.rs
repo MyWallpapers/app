@@ -115,83 +115,84 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
+        // 1. On récupère le gestionnaire de bureau principal
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
 
-        // 1. Demande de scission du bureau
+        // 2. L'ordre de scission officiel (Message 0x052C)
+        // C'est le message interne de Microsoft. On l'envoie une seule fois, proprement.
         let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
-        struct Found {
+        // Structure pour récupérer simultanément nos deux cibles
+        struct LayerData {
             worker_w: HWND,
             sys_list_view: HWND,
         }
-        let mut found = Found { worker_w: HWND::default(), sys_list_view: HWND::default() };
+        let mut data = LayerData { worker_w: HWND::default(), sys_list_view: HWND::default() };
 
+        // 3. La logique de recherche absolue
         unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let found = &mut *(lparam.0 as *mut Found);
+            let data = &mut *(lparam.0 as *mut LayerData);
+            
+            // On cherche la fenêtre qui abrite le système d'icônes
             if let Ok(shell) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
-                if !shell.is_invalid() {
-                    if let Ok(slv) = FindWindowExW(shell, HWND::default(), windows::core::w!("SysListView32"), None) {
-                        if !slv.is_invalid() { found.sys_list_view = slv; }
-                    }
-                    if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
-                        if !w.is_invalid() {
-                            found.worker_w = w;
-                            return BOOL(0); // On a trouvé, on arrête l'énumération
-                        }
-                    }
+                
+                // On récupère la grille d'icônes (pour notre hook de souris)
+                if let Ok(slv) = FindWindowExW(shell, HWND::default(), windows::core::w!("SysListView32"), None) {
+                    data.sys_list_view = slv;
                 }
+                
+                // RÈGLE D'OR DE L'OS : Le fond d'écran (WorkerW) est TOUJOURS le frère 
+                // qui suit immédiatement le conteneur d'icônes dans la hiérarchie.
+                // (On ne vérifie pas IsWindowVisible car DWM ne l'a pas encore peinte !)
+                if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                    data.worker_w = w;
+                }
+                
+                return BOOL(0); // On a nos fenêtres, on stoppe la recherche
             }
-            BOOL(1) // Continuer la recherche
+            BOOL(1) // Sinon on continue de fouiller
         }
 
-        // 2. MÉTHODE PROPRE : Polling (Boucle de tentative) 
+        // 4. Exécution de la recherche (On laisse à DWM max 1 seconde pour s'exécuter)
         let mut attempts = 0;
         while attempts < 10 {
-            let _ = EnumWindows(Some(callback), LPARAM(&mut found as *mut Found as isize));
-            if !found.worker_w.is_invalid() {
-                break; // Trouvé ! On sort de la boucle immédiatement.
+            let _ = EnumWindows(Some(callback), LPARAM(&mut data as *mut LayerData as isize));
+            if !data.worker_w.is_invalid() {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             attempts += 1;
         }
 
-        // --- GESTION DU FALLBACK SI WORKERW ÉCHOUE ---
-        if found.worker_w.is_invalid() {
-            warn!("WorkerW introuvable. Activation du Fallback d'urgence (HWND_BOTTOM).");
-            
-            // PLAN B : Méthode HWND_BOTTOM (Infaillible)
-            // On force la fenêtre tout au fond, derrière toutes les applications.
-            let _ = SetWindowPos(
-                our_hwnd, 
-                HWND_BOTTOM, 
-                0, 0, 0, 0, 
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
-            );
-            
-            mouse_hook::start_hook_thread();
-            return Ok(());
+        // 5. Gestion stricte des erreurs (PAS DE FALLBACK)
+        if data.worker_w.is_invalid() {
+            return Err("Erreur critique: Windows n'a pas généré le WorkerW d'arrière-plan.".to_string());
         }
 
-        // --- PLAN A : INJECTION DANS WORKERW ---
+        // On transmet les HWND au thread de la souris
         mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
-        if !found.sys_list_view.is_invalid() {
-            mouse_hook::set_syslistview_hwnd(found.sys_list_view.0 as isize);
+        if !data.sys_list_view.is_invalid() {
+            mouse_hook::set_syslistview_hwnd(data.sys_list_view.0 as isize);
         }
 
         let current_parent = GetParent(our_hwnd);
-        if current_parent != Ok(found.worker_w) {
+        if current_parent != Ok(data.worker_w) {
             
-            // Sécurité styles pour l'injection
+            // 6. ADAPTATION OS (Windows 11 vs Windows 10)
+            // L'API Desktop Window Manager (DWM) de Windows 11 a changé ses règles de sécurité.
+            // Elle interdit formellement à une fenêtre "POPUP" de s'injecter sous les icônes.
+            // On convertit notre fenêtre en "CHILD" de force pour respecter l'OS.
             let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
             style &= !(WS_POPUP.0 as i32); 
             style |= WS_CHILD.0 as i32;    
             let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
 
-            let _ = SetParent(our_hwnd, found.worker_w);
+            // 7. L'injection finale et parfaite
+            let _ = SetParent(our_hwnd, data.worker_w);
             
+            // On fige la position et la taille (Tauri s'en occupe, pas Windows)
             let _ = SetWindowPos(
                 our_hwnd, 
                 HWND::default(), 
@@ -199,7 +200,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE
             );
             
-            info!("Injected into WorkerW successfully");
+            log::info!("Injected native Webview perfectly behind desktop icons.");
         }
     }
 
