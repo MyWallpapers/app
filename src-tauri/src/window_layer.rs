@@ -108,6 +108,7 @@ pub fn restore_desktop_icons() {
 
 #[cfg(target_os = "windows")]
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use tauri::Manager;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -229,7 +230,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicIsize, AtomicBool, Ordering};
     use std::sync::OnceLock;
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -380,7 +381,7 @@ pub mod mouse_hook {
             }
 
             unsafe {
-                if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
+                if let Ok(_h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
                     log::info!("Global mouse hook installed with Drag&Drop Engine");
                     let mut msg = MSG::default();
                     while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
