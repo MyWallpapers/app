@@ -513,29 +513,49 @@ pub mod mouse_hook {
     }
 
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
-        use windows::core::VARIANT;
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+        use windows::core::Interface;
 
-        let pt = windows::Win32::Foundation::POINT { x, y };
-        let mut p_acc: Option<IAccessible> = None;
-        let mut var_child = VARIANT::default();
+        let slv_raw = get_syslistview_hwnd();
+        if slv_raw == 0 { return false; }
+        let slv = HWND(slv_raw as *mut core::ffi::c_void);
 
-        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
-            if let Some(acc) = p_acc {
-                if let Ok(role_var) = acc.get_accRole(&var_child) {
-                    if let Ok(role_val) = i32::try_from(&role_var) {
-                        return role_val == 34; // 34 = ROLE_SYSTEM_LISTITEM
-                    }
+        // Get IAccessible directly from SysListView32 client area.
+        // This bypasses the global AccessibleObjectFromPoint hit-test which
+        // composition mode WebView intercepts via its accessibility proxy.
+        let mut raw_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let objid_client: u32 = 0xFFFFFFFC; // OBJID_CLIENT
+        if AccessibleObjectFromWindow(slv, objid_client, &IAccessible::IID, &mut raw_ptr).is_err()
+            || raw_ptr.is_null()
+        {
+            return false;
+        }
+        let acc: IAccessible = IAccessible::from_raw(raw_ptr);
+
+        // accHitTest checks if screen point (x,y) is over a child item (icon).
+        // Returns VT_I4(0) = background, VT_I4(>0) = icon child ID, VT_DISPATCH = icon object.
+        match acc.accHitTest(x as i32, y as i32) {
+            Ok(hit) => {
+                if let Ok(val) = i32::try_from(&hit) {
+                    val > 0
+                } else {
+                    true // VT_DISPATCH = child accessible object = icon
                 }
             }
+            Err(_) => false,
         }
-        false
     }
 
     // HWND cache — avoids recomputing is_over_desktop when cursor stays over the same window.
     // Saves ~6 Win32 API calls per mouse event in the common case (cursor over a normal app).
     static CACHED_HWND: AtomicIsize = AtomicIsize::new(0);
     static CACHED_IS_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the cursor is currently hovering over a desktop icon (continuous tracking in IDLE).
+    /// When true, ALL mouse events pass to OS — the "icon owns all inputs" behavior.
+    static OVER_ICON: AtomicBool = AtomicBool::new(false);
+    /// Tick counter for throttled icon hover checks (every 8th MOUSE_MOVE)
+    static ICON_CHECK_TICK: AtomicU32 = AtomicU32::new(0);
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
     /// Only recomputes when the window under cursor changes.
@@ -669,6 +689,7 @@ pub mod mouse_hook {
                         let is_over_desktop = check_is_over_desktop(hwnd_under, wv);
 
                         if !is_over_desktop {
+                            OVER_ICON.store(false, Ordering::Relaxed);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, pt.x, pt.y);
                             }
@@ -678,16 +699,32 @@ pub mod mouse_hook {
                         // Cursor is over desktop in IDLE state
                         if msg == WM_MOUSEMOVE {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
+                            // Throttled icon hover detection — every 8th move (~8ms at 125Hz)
+                            let tick = ICON_CHECK_TICK.fetch_add(1, Ordering::Relaxed);
+                            if tick % 8 == 0 {
+                                OVER_ICON.store(
+                                    is_mouse_over_desktop_icon(pt.x, pt.y),
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
 
-                        // State transition on mousedown
+                        // State transition on mousedown — always do precise icon check
                         if is_down {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
+                                OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
+                            OVER_ICON.store(false, Ordering::Relaxed);
                             HOOK_STATE.store(STATE_WEB, Ordering::Relaxed);
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
+                        }
+
+                        // If hovering over a desktop icon, pass all events to OS
+                        // (the "icon owns all inputs" behavior)
+                        if OVER_ICON.load(Ordering::Relaxed) {
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
                         // Forward to WebView (hover moves in IDLE + first click IDLE→WEB)
