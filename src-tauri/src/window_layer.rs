@@ -221,20 +221,27 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             return;
         }
 
-        // Règle d'or de DWM : Toute fenêtre injectée doit devenir un "Enfant"
+        // Strip all frame styles — WS_POPUP, WS_THICKFRAME (resize border),
+        // WS_CAPTION, WS_BORDER. Tauri may leave WS_THICKFRAME even with decorations:false.
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
         style &= !(WS_POPUP.0 as i32);
+        style &= !(WS_THICKFRAME.0 as i32);
+        style &= !(WS_CAPTION.0 as i32);
         style |= WS_CHILD.0 as i32;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
 
         let _ = SetParent(our_hwnd, detection.target_parent);
 
+        // SWP_FRAMECHANGED forces DWM to recalculate the non-client area,
+        // eliminating the ~7-8px invisible border left over from the old styles.
         if detection.is_24h2 {
-            // Z-Order chirurgical dans Progman : Sous les icônes, SUR le vieux WorkerW
-            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
-            let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
+            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+            let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
         } else {
-            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
     }
 }
