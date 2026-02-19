@@ -16,6 +16,7 @@
 //! - "MWP_T": Target marker — set by host app on Chrome_RenderWidgetHostHWND
 //! - "MWP_E": Explicit leave flag — set by host before intentional WM_MOUSELEAVE
 //! - "MWP_SC": Suppress count — incremented by DLL each suppression (diagnostic)
+//! - "MWP_HB": Heartbeat — incremented on every hook call (proves DLL is loaded)
 
 #![cfg(target_os = "windows")]
 
@@ -44,10 +45,16 @@ pub unsafe extern "system" fn mouseleave_hook_proc(
 ) -> LRESULT {
     if code >= 0 && lparam.0 != 0 {
         let msg = &mut *(lparam.0 as *mut MSG);
-        if msg.message == WM_MOUSELEAVE_U32 {
-            // Check if this HWND is marked as our target
-            let target = GetPropW(msg.hwnd, w!("MWP_T"));
-            if prop_is_set(target) {
+
+        // Heartbeat: increment on every call to prove DLL is loaded and running.
+        // Only on our target HWND to avoid noise from other windows.
+        let target = GetPropW(msg.hwnd, w!("MWP_T"));
+        if prop_is_set(target) {
+            let prev_hb = GetPropW(msg.hwnd, w!("MWP_HB"));
+            let hb_count = (prev_hb.0 as usize).wrapping_add(1);
+            let _ = SetPropW(msg.hwnd, w!("MWP_HB"), HANDLE(hb_count as *mut _));
+
+            if msg.message == WM_MOUSELEAVE_U32 {
                 // Check if host explicitly sent this WM_MOUSELEAVE
                 let explicit = GetPropW(msg.hwnd, w!("MWP_E"));
                 if prop_is_set(explicit) {

@@ -68,7 +68,7 @@
         "focus": false,
         "visible": false,
         "devtools": true,
-        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows"
+        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion,RendererCodeIntegrity --disable-backgrounding-occluded-windows"
       }
     ],
     "trayIcon": {

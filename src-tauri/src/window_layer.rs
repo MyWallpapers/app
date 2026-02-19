@@ -315,7 +315,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -354,6 +354,15 @@ pub mod mouse_hook {
 
     /// Debug: log first unknown window encounter
     static UNKNOWN_HWND_LOGGED: AtomicBool = AtomicBool::new(false);
+
+    /// In-process hook: tracks whether an explicit leave is pending
+    static EXPLICIT_LEAVE: AtomicBool = AtomicBool::new(false);
+    /// In-process hook: suppress count (diagnostic)
+    static INPROC_SUPPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// In-process hook: heartbeat — incremented on EVERY message processed by hook
+    static INPROC_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+    /// Whether the in-process hook is active (vs DLL-based cross-process hook)
+    static INPROC_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -399,17 +408,37 @@ pub mod mouse_hook {
         if data.found.is_invalid() { None } else { Some(data.found) }
     }
 
-    /// Installs WH_GETMESSAGE hook on Chromium's UI thread via companion DLL.
+    /// In-process WH_GETMESSAGE hook proc — used when Chrome_RenderWidgetHostHWND
+    /// is in our Tauri process. Runs in Chrome's thread context but accesses our
+    /// process globals directly via atomics. No DLL injection needed.
+    unsafe extern "system" fn inproc_getmsg_hook(
+        code: i32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 && lparam.0 != 0 {
+            INPROC_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+            let msg = &mut *(lparam.0 as *mut MSG);
+            if msg.message == WM_MOUSELEAVE {
+                let target = CHROME_WIDGET_HWND.load(Ordering::Relaxed);
+                if target != 0 && msg.hwnd.0 as isize == target {
+                    if EXPLICIT_LEAVE.swap(false, Ordering::Relaxed) {
+                        // Intentional leave from host — allow through
+                    } else {
+                        // Spurious WM_MOUSELEAVE from TrackMouseEvent — suppress
+                        msg.message = 0; // WM_NULL
+                        INPROC_SUPPRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+    }
+
+    /// Installs WH_GETMESSAGE hook on Chromium's UI thread to suppress spurious
+    /// WM_MOUSELEAVE from TrackMouseEvent.
     ///
-    /// Chrome_RenderWidgetHostHWND is owned by the WebView2 browser process
-    /// (msedgewebview2.exe), not our Tauri process. SetWindowsHookExW with
-    /// hmod=None only works for same-process threads (ERROR_ACCESS_DENIED).
-    /// For cross-process hooks, Windows requires a DLL to inject into the target.
-    ///
-    /// The DLL (mouseleave_hook.dll) contains the hook proc that suppresses
-    /// spurious WM_MOUSELEAVE from TrackMouseEvent. Cross-process communication
-    /// uses window properties (SetPropW/GetPropW) stored in the kernel's window
-    /// manager — accessible from both processes.
+    /// Two strategies depending on whether Chrome_RenderWidgetHostHWND is in our process:
+    /// - Same process: in-process hook via function pointer (no DLL injection needed)
+    /// - Different process: cross-process hook via companion DLL injection
     unsafe fn install_chrome_msg_hook(cw: HWND) {
         use windows::Win32::System::LibraryLoader::{LoadLibraryW, GetProcAddress};
         use windows::core::PCWSTR;
@@ -419,7 +448,60 @@ pub mod mouse_hook {
         let prop_ok = SetPropW(cw, windows::core::w!("MWP_T"), HANDLE(1 as *mut _));
         log::info!("SetPropW(MWP_T) on Chrome HWND 0x{:X}: ok={}", cw.0 as isize, prop_ok.is_ok());
 
-        // Find the hook DLL next to the executable
+        // Determine which process owns Chrome_RenderWidgetHostHWND
+        let mut chrome_pid: u32 = 0;
+        let chrome_tid = GetWindowThreadProcessId(cw, Some(&mut chrome_pid));
+        let our_pid = std::process::id();
+        let same_process = chrome_pid == our_pid;
+
+        log::info!(
+            "Chrome HWND 0x{:X} — thread={} pid={} (our pid={}) same_process={}",
+            cw.0 as isize, chrome_tid, chrome_pid, our_pid, same_process
+        );
+
+        if chrome_tid == 0 {
+            log::warn!("Failed to get Chrome HWND thread ID — hover suppression disabled");
+            return;
+        }
+
+        // === Strategy 1: In-process hook (Chrome HWND in our Tauri process) ===
+        // No DLL injection needed — hook proc accesses our globals directly via atomics.
+        if same_process {
+            match SetWindowsHookExW(WH_GETMESSAGE, Some(inproc_getmsg_hook), None, chrome_tid) {
+                Ok(h) => {
+                    INPROC_HOOK_ACTIVE.store(true, Ordering::SeqCst);
+                    log::info!(
+                        "IN-PROCESS WH_GETMESSAGE hook installed on Chrome thread {} hook={:?}",
+                        chrome_tid, h
+                    );
+                    // Diagnostic: monitor suppress count
+                    std::thread::spawn(move || {
+                        for i in 0..6 {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            log::info!(
+                                "[DIAG] in-process hook after {}s: suppress={} heartbeat={}",
+                                (i + 1) * 3,
+                                INPROC_SUPPRESS_COUNT.load(Ordering::Relaxed),
+                                INPROC_HEARTBEAT.load(Ordering::Relaxed),
+                            );
+                        }
+                    });
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("In-process hook failed: {} — falling back to DLL injection", e);
+                }
+            }
+        }
+
+        // === Strategy 2: Cross-process hook via DLL injection ===
+        // Chrome_RenderWidgetHostHWND is in msedgewebview2.exe.
+        // SetWindowsHookExW requires a DLL module for cross-process hooks.
+        // NOTE: WebView2's Code Integrity Guard (CIG) may block unsigned DLL injection.
+        // The --disable-features=RendererCodeIntegrity browser arg is set in tauri.conf.json
+        // to attempt to bypass this.
+        log::info!("Using cross-process DLL hook (Chrome HWND in pid {})", chrome_pid);
+
         let dll_path = match std::env::current_exe() {
             Ok(exe) => exe.parent().unwrap_or(std::path::Path::new(".")).join("mouseleave_hook.dll"),
             Err(_) => {
@@ -436,7 +518,6 @@ pub mod mouse_hook {
             }
         }
 
-        // Load the DLL into our process (Windows uses the path to load it into WebView2 too)
         let wide: Vec<u16> = dll_path.as_os_str().encode_wide().chain(Some(0)).collect();
         let hmod = match LoadLibraryW(PCWSTR(wide.as_ptr())) {
             Ok(h) => h,
@@ -446,7 +527,6 @@ pub mod mouse_hook {
             }
         };
 
-        // Get the exported hook proc address
         let proc_addr = match GetProcAddress(hmod, windows::core::s!("mouseleave_hook_proc")) {
             Some(addr) => addr,
             None => {
@@ -457,31 +537,25 @@ pub mod mouse_hook {
 
         let hook_proc: HOOKPROC = Some(std::mem::transmute(proc_addr));
 
-        let chrome_tid = GetWindowThreadProcessId(cw, None);
-        if chrome_tid == 0 {
-            log::warn!("Failed to get Chrome HWND thread ID — hover suppression disabled");
-            return;
-        }
-
-        // Install WH_GETMESSAGE hook on Chrome's thread.
-        // Windows loads the DLL into the WebView2 browser process and calls
-        // our hook proc there — suppressing spurious WM_MOUSELEAVE.
         match SetWindowsHookExW(WH_GETMESSAGE, hook_proc, hmod, chrome_tid) {
             Ok(h) => {
                 log::info!(
-                    "WH_GETMESSAGE hook installed on Chrome thread {} via DLL hook={:?}",
+                    "CROSS-PROCESS WH_GETMESSAGE hook installed on Chrome thread {} via DLL hook={:?}",
                     chrome_tid, h
                 );
-                // Diagnostic: monitor suppress count from the DLL
+                // Diagnostic: monitor suppress count + heartbeat from the DLL
                 let cw_raw = cw.0 as isize;
                 std::thread::spawn(move || {
                     for i in 0..6 {
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         let cw = HWND(cw_raw as *mut core::ffi::c_void);
                         let sc = GetPropW(cw, windows::core::w!("MWP_SC"));
-                        let count = sc.0 as usize;
-                        log::info!("[DIAG] hook suppress count after {}s: {} (MWP_T={}, MWP_E={})",
-                            (i + 1) * 3, count,
+                        let hb = GetPropW(cw, windows::core::w!("MWP_HB"));
+                        log::info!(
+                            "[DIAG] DLL hook after {}s: suppress={} heartbeat={} (MWP_T={}, MWP_E={})",
+                            (i + 1) * 3,
+                            sc.0 as usize,
+                            hb.0 as usize,
                             !GetPropW(cw, windows::core::w!("MWP_T")).0.is_null(),
                             !GetPropW(cw, windows::core::w!("MWP_E")).0.is_null(),
                         );
@@ -633,8 +707,12 @@ pub mod mouse_hook {
                                 let cw_raw = get_chrome_widget_hwnd();
                                 if cw_raw != 0 {
                                     let cw = HWND(cw_raw as *mut core::ffi::c_void);
-                                    // Set property so our DLL hook lets this WM_MOUSELEAVE through
-                                    let _ = SetPropW(cw, windows::core::w!("MWP_E"), HANDLE(1 as *mut _));
+                                    // Signal our hook to let this intentional WM_MOUSELEAVE through
+                                    if INPROC_HOOK_ACTIVE.load(Ordering::Relaxed) {
+                                        EXPLICIT_LEAVE.store(true, Ordering::Relaxed);
+                                    } else {
+                                        let _ = SetPropW(cw, windows::core::w!("MWP_E"), HANDLE(1 as *mut _));
+                                    }
                                     let _ = PostMessageW(cw, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
                                     log::info!("[HOOK] cursor left desktop → sent explicit WM_MOUSELEAVE");
                                 }
