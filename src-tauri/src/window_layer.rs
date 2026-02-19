@@ -736,10 +736,12 @@ pub mod mouse_hook {
             }
         });
 
-        // OS hook thread
+        // OS hook thread — elevated priority to prevent WH_MOUSE_LL timeout
         std::thread::spawn(|| {
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                use windows::Win32::System::Threading::{SetThreadPriority, GetCurrentThread, THREAD_PRIORITY_HIGHEST};
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             }
