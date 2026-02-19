@@ -28,6 +28,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "mouseleave_hook.dll"
+    ],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",

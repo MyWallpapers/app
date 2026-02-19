@@ -122,12 +122,17 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
           echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
 
-      - name: Build hook DLL (Windows only)
+      - name: Build hook DLL (Windows)
         if: matrix.platform == 'windows-latest'
         shell: bash
         run: |
           cargo build --manifest-path hook-dll/Cargo.toml --release
           cp hook-dll/target/release/mouseleave_hook.dll src-tauri/
+
+      - name: Create dummy hook DLL (non-Windows)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: touch src-tauri/mouseleave_hook.dll
 
       - name: Build
         shell: bash
