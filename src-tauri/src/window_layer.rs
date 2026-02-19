@@ -663,10 +663,14 @@ pub mod mouse_hook {
 
     // --- Double-click synthesis ---
     // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd WM_LBUTTONDOWN events.
-    // We detect double-clicks manually using timing + position thresholds.
-    static LAST_CLICK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // We detect double-clicks manually using MSLLHOOKSTRUCT.time (kernel tick count, ms).
+    static LAST_CLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static LAST_CLICK_X: AtomicI32 = AtomicI32::new(0);
     static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(0);
+    // Cached system metrics (rarely change, no need to syscall every mousedown)
+    static DBL_CLICK_TIME: AtomicU32 = AtomicU32::new(0);
+    static DBL_CLICK_CX: AtomicI32 = AtomicI32::new(0);
+    static DBL_CLICK_CY: AtomicI32 = AtomicI32::new(0);
 
 
     /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
@@ -823,6 +827,14 @@ pub mod mouse_hook {
             }
         });
 
+        // Cache double-click metrics once (syscall-free in the hot path)
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+            DBL_CLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
+            DBL_CLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK), Ordering::Relaxed);
+            DBL_CLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK), Ordering::Relaxed);
+        }
+
         // OS hook thread — elevated priority to prevent WH_MOUSE_LL timeout
         std::thread::spawn(|| {
             unsafe {
@@ -921,26 +933,15 @@ pub mod mouse_hook {
 
                                 // Double-click synthesis for left button:
                                 // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd events.
-                                // Detect manually: if two LBUTTONDOWNs occur within GetDoubleClickTime
-                                // and within SM_CXDOUBLECLK/SM_CYDOUBLECLK pixels, send DBLCLK instead.
+                                // Uses info.time (kernel tick count, ms) — zero-cost, already in hook data.
                                 if msg == WM_LBUTTONDOWN {
-                                    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
-                                    let prev_time = LAST_CLICK_TIME.load(Ordering::Relaxed);
-                                    let prev_x = LAST_CLICK_X.load(Ordering::Relaxed);
-                                    let prev_y = LAST_CLICK_Y.load(Ordering::Relaxed);
-                                    let dbl_time = GetDoubleClickTime() as u64;
-                                    let cx = GetSystemMetrics(SM_CXDOUBLECLK);
-                                    let cy = GetSystemMetrics(SM_CYDOUBLECLK);
-
-                                    if now - prev_time <= dbl_time
-                                        && (pt.x - prev_x).abs() <= cx
-                                        && (pt.y - prev_y).abs() <= cy
+                                    let now = info.time;
+                                    let prev = LAST_CLICK_TIME.load(Ordering::Relaxed);
+                                    let elapsed = now.wrapping_sub(prev); // handles tick wraparound
+                                    if elapsed <= DBL_CLICK_TIME.load(Ordering::Relaxed)
+                                        && (pt.x - LAST_CLICK_X.load(Ordering::Relaxed)).abs() <= DBL_CLICK_CX.load(Ordering::Relaxed)
+                                        && (pt.y - LAST_CLICK_Y.load(Ordering::Relaxed)).abs() <= DBL_CLICK_CY.load(Ordering::Relaxed)
                                     {
-                                        // Second click within threshold → send WM_LBUTTONDBLCLK
                                         log::info!("[hook] double-click detected ({},{})", pt.x, pt.y);
                                         forward_to_syslistview(0x0203, pt); // WM_LBUTTONDBLCLK
                                         LAST_CLICK_TIME.store(0, Ordering::Relaxed);
