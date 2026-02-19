@@ -269,6 +269,10 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         });
     }
 
+    // Create hidden message-only window on the UI thread for dispatching
+    // SendMouseInput calls (STA-bound — must run on the thread that created the WebView2)
+    mouse_hook::init_dispatch_window();
+
     if detection.is_24h2 {
         info!("Moteur Windows 11 24H2 activé.");
     } else {
@@ -364,10 +368,9 @@ pub mod mouse_hook {
 
     /// Raw COM pointer to ICoreWebView2CompositionController.
     /// Set from the main thread after WebView2 creation.
-    /// Used by the hook thread to call SendMouseInput.
     static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
 
-    /// MK_* flag of the button that initiated the current drag
+    /// Virtual key flag of the button that initiated the current drag
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
 
     /// AppHandle for visibility watchdog events (wallpaper-visibility)
@@ -380,6 +383,13 @@ pub mod mouse_hook {
 
     /// Tracks whether cursor was over desktop on previous move (for SendMouseInput LEAVE)
     static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+    // --- UI thread dispatch for SendMouseInput (STA-bound) ---
+    // SendMouseInput must be called from the thread that created the composition controller.
+    // The hook runs on a separate thread, so we PostMessage to a hidden window on the UI thread.
+    const WM_MWP_MOUSE: u32 = 0x8000 + 42; // WM_APP + 42
+    static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
+    static PENDING_WHEEL_DATA: AtomicU32 = AtomicU32::new(0);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -399,20 +409,78 @@ pub mod mouse_hook {
     pub fn set_comp_controller_ptr(ptr: isize) { COMP_CONTROLLER_PTR.store(ptr, Ordering::SeqCst); }
     fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
 
-    /// Send a mouse event via the composition controller's SendMouseInput.
-    /// Bypasses the Windows message queue entirely — no TrackMouseEvent, no WM_MOUSELEAVE race.
+    /// Queue a mouse event for dispatch on the UI thread via PostMessage.
+    /// SendMouseInput is STA-bound and must be called from the UI thread.
     #[inline]
     unsafe fn send_input(event_kind: i32, virtual_keys: i32, mouse_data: u32, x: i32, y: i32) -> bool {
-        let ptr = get_comp_controller_ptr();
-        if ptr == 0 { return false; }
-        match wry::send_mouse_input_raw(ptr, event_kind, virtual_keys, mouse_data, x, y) {
-            Ok(()) => true,
-            Err(e) => {
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    log::warn!("SendMouseInput failed: {}", e);
+        let dh = DISPATCH_HWND.load(Ordering::Relaxed);
+        if dh == 0 { return false; }
+        // For wheel events, stash the delta (consumed by dispatch proc)
+        if mouse_data != 0 {
+            PENDING_WHEEL_DATA.store(mouse_data, Ordering::Relaxed);
+        }
+        let wparam = WPARAM((event_kind as u16 as usize) | ((virtual_keys as u16 as usize) << 16));
+        let lparam = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
+        PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wparam, lparam).is_ok()
+    }
+
+    /// WndProc for the hidden dispatch window — runs on the UI thread.
+    /// Unpacks mouse event params and calls SendMouseInput.
+    unsafe extern "system" fn dispatch_wnd_proc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_MWP_MOUSE {
+            let event_kind = (wparam.0 & 0xFFFF) as i32;
+            let virtual_keys = ((wparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let mouse_data = if event_kind == MOUSE_WHEEL || event_kind == MOUSE_HWHEEL {
+                PENDING_WHEEL_DATA.load(Ordering::Relaxed)
+            } else {
+                0
+            };
+
+            let ptr = get_comp_controller_ptr();
+            if ptr != 0 {
+                if let Err(e) = wry::send_mouse_input_raw(ptr, event_kind, virtual_keys, mouse_data, x, y) {
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        log::warn!("SendMouseInput dispatch failed: {}", e);
+                    }
                 }
-                false
+            }
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// Create a message-only window for dispatching SendMouseInput calls on the UI thread.
+    /// Must be called from the main/UI thread (the thread that created the WebView2).
+    pub fn init_dispatch_window() {
+        unsafe {
+            let class_name = windows::core::w!("MWP_MouseDispatch");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dispatch_wnd_proc),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name,
+                windows::core::w!(""),
+                WINDOW_STYLE(0),
+                0, 0, 0, 0,
+                HWND_MESSAGE,
+                None, None, None,
+            ) {
+                Ok(h) => {
+                    DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                    log::info!("Mouse dispatch window created: 0x{:X}", h.0 as isize);
+                }
+                Err(e) => {
+                    log::warn!("Failed to create mouse dispatch window: {}", e);
+                }
             }
         }
     }
