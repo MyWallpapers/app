@@ -683,6 +683,28 @@ pub mod mouse_hook {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 
+    /// PostMessage a mouse event to SysListView32 for guaranteed delivery.
+    /// WS_EX_TRANSPARENT doesn't affect child window hit-testing on Win11,
+    /// so we need direct delivery for the initial interactions (hover + mousedown).
+    /// SysListView32 then calls SetCapture, allowing real events for drag & drop.
+    #[inline]
+    unsafe fn forward_to_syslistview(msg: u32, pt: windows::Win32::Foundation::POINT) {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+        if slv.is_invalid() { return; }
+        let mut client_pt = pt;
+        let _ = ScreenToClient(slv, &mut client_pt);
+        let mut mk: u32 = 0;
+        if GetKeyState(0x01) < 0 { mk |= 0x0001; } // MK_LBUTTON
+        if GetKeyState(0x02) < 0 { mk |= 0x0002; } // MK_RBUTTON
+        if GetKeyState(0x10) < 0 { mk |= 0x0004; } // MK_SHIFT
+        if GetKeyState(0x11) < 0 { mk |= 0x0008; } // MK_CONTROL
+        if GetKeyState(0x04) < 0 { mk |= 0x0010; } // MK_MBUTTON
+        let lp = LPARAM(((client_pt.y as u32 & 0xFFFF) << 16 | (client_pt.x as u32 & 0xFFFF)) as isize);
+        let _ = PostMessageW(slv, msg, WPARAM(mk as usize), lp);
+    }
+
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
     /// Only recomputes when the window under cursor changes.
     #[inline]
@@ -880,8 +902,11 @@ pub mod mouse_hook {
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                // Ensure WebView is transparent so real click reaches icons
-                                set_webview_click_through(wv, true);
+                                // PostMessage guarantees SysListView32 receives the click
+                                // (WS_EX_TRANSPARENT doesn't work for child window hit-testing).
+                                // SysListView32 will call SetCapture, so subsequent real events
+                                // (via CallNextHookEx in STATE_NATIVE) reach it for drag & drop.
+                                forward_to_syslistview(msg, pt);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
@@ -890,9 +915,12 @@ pub mod mouse_hook {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        // If hovering over a desktop icon, let events pass natively
-                        // (WS_EX_TRANSPARENT is set so moves reach SysListView32 for highlights)
+                        // If hovering over a desktop icon, PostMessage for hover highlighting
+                        // + CallNextHookEx so real events flow through the system.
                         if OVER_ICON.load(Ordering::Relaxed) {
+                            if msg == WM_MOUSEMOVE {
+                                forward_to_syslistview(msg, pt);
+                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
