@@ -406,8 +406,15 @@ pub mod mouse_hook {
     // --- UI thread dispatch for SendMouseInput (STA-bound) ---
     // SendMouseInput must be called from the thread that created the composition controller.
     // The hook runs on a separate thread, so we PostMessage to a hidden window on the UI thread.
-    const WM_MWP_MOUSE: u32 = 0x8000 + 42; // WM_APP + 42
+    const WM_MWP_MOUSE: u32 = 0x8000 + 42;      // WM_APP + 42  (clicks, scroll, leave)
+    const WM_MWP_MOUSE_MOVE: u32 = 0x8000 + 43;  // WM_APP + 43  (atomic-coalesced moves)
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    // Atomic move coalescing — at most 1 pending move message in the UI queue.
+    // The hook writes coords here; the UI thread reads them when it processes WM_MWP_MOUSE_MOVE.
+    static PENDING_MOVE_X: AtomicI32 = AtomicI32::new(0);
+    static PENDING_MOVE_Y: AtomicI32 = AtomicI32::new(0);
+    static MOVE_QUEUED: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -443,28 +450,46 @@ pub mod mouse_hook {
         PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wparam, lparam).is_ok()
     }
 
+    /// Atomic move dispatcher — guarantees at most 1 pending move message in the UI queue.
+    /// Coords are written to atomics; only posts WM_MWP_MOUSE_MOVE if none is already queued.
+    #[inline]
+    unsafe fn send_move_input(x: i32, y: i32) {
+        PENDING_MOVE_X.store(x, Ordering::Relaxed);
+        PENDING_MOVE_Y.store(y, Ordering::Relaxed);
+        if !MOVE_QUEUED.swap(true, Ordering::Release) {
+            let dh = DISPATCH_HWND.load(Ordering::Relaxed);
+            if dh != 0 {
+                let _ = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE_MOVE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     /// WndProc for the hidden dispatch window — runs on the UI thread.
     /// Unpacks mouse event params and calls SendMouseInput.
     unsafe extern "system" fn dispatch_wnd_proc(
         hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
     ) -> LRESULT {
+        // Atomic-coalesced mouse move — reads latest coords from atomics.
+        // At most 1 of these is ever pending, regardless of mouse polling rate.
+        if msg == WM_MWP_MOUSE_MOVE {
+            MOVE_QUEUED.store(false, Ordering::Acquire);
+            let x = PENDING_MOVE_X.load(Ordering::Relaxed);
+            let y = PENDING_MOVE_Y.load(Ordering::Relaxed);
+            let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
+            let ptr = get_comp_controller_ptr();
+            if ptr != 0 {
+                let _ = wry::send_mouse_input_raw(ptr, MOUSE_MOVE, vk, 0, x, y);
+            }
+            return LRESULT(0);
+        }
+
+        // Clicks, scroll, leave — dispatched via packed wparam/lparam
         if msg == WM_MWP_MOUSE {
             let event_kind = (wparam.0 & 0xFFFF) as i32;
             let virtual_keys = ((wparam.0 >> 16) & 0xFFFF) as i32;
             let mouse_data = ((wparam.0 >> 32) & 0xFFFFFFFF) as u32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-            // Coalesce consecutive MOUSE_MOVE: if a newer MOVE is already queued, skip this one.
-            // This prevents stale position updates from piling up when the UI thread is behind.
-            if event_kind == MOUSE_MOVE {
-                let mut peek = MSG::default();
-                if PeekMessageW(&mut peek, hwnd, WM_MWP_MOUSE, WM_MWP_MOUSE, PM_NOREMOVE).into() {
-                    if (peek.wParam.0 & 0xFFFF) as i32 == MOUSE_MOVE {
-                        return LRESULT(0);
-                    }
-                }
-            }
 
             let ptr = get_comp_controller_ptr();
             if ptr != 0 {
@@ -656,8 +681,8 @@ pub mod mouse_hook {
 
         match msg {
             WM_MOUSEMOVE => {
-                let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
-                send_input(MOUSE_MOVE, vk, 0, x, y);
+                // Atomic fast-lane: at most 1 pending move in the UI queue
+                send_move_input(x, y);
             }
             WM_LBUTTONDOWN => {
                 DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
