@@ -66,7 +66,7 @@
         "focus": false,
         "visible": false,
         "devtools": true,
-        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
+        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
     ],
     "trayIcon": {

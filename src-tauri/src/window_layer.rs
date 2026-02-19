@@ -974,7 +974,7 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
     // Dans Tauri 2, on récupère le pointeur NSWindow directement de manière sécurisée
     let ns_window = window.ns_window().map_err(|e| e.to_string())? as *mut objc::runtime::Object;
 
-    use objc::{msg_send, sel, sel_impl};
+    use objc::{msg_send, sel, sel_impl, class};
     unsafe {
         // kCGDesktopWindowLevel = -2147483623
         let _: () = msg_send![ns_window, setLevel: -2147483623_isize];
@@ -982,8 +982,19 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
         let _: () = msg_send![ns_window, setCollectionBehavior: 81_usize];
         // Désactive les interactions directes pour laisser passer les clics au bureau si besoin
         let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
+
+        // Disable App Nap — macOS aggressively throttles background apps.
+        // NSActivityUserInitiated | NSActivityLatencyCritical = 0x00FFFFFF
+        let process_info: *mut objc::runtime::Object = msg_send![class!(NSProcessInfo), processInfo];
+        let reason: *mut objc::runtime::Object = msg_send![class!(NSString), alloc];
+        let reason: *mut objc::runtime::Object = msg_send![reason, initWithBytes:b"Wallpaper Animation\0".as_ptr()
+            length:19_usize
+            encoding:4_usize]; // NSUTF8StringEncoding = 4
+        let _activity: *mut objc::runtime::Object = msg_send![process_info,
+            beginActivityWithOptions:0x00FFFFFF_u64
+            reason:reason];
     }
 
-    info!("macOS: Desktop window setup complete (Behind icons)");
+    info!("macOS: Desktop window setup complete (Behind icons, App Nap disabled)");
     Ok(())
 }
