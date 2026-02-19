@@ -79,6 +79,13 @@ struct DCompState {
   visual: IDCompositionVisual,
 }
 
+/// Result of controller creation — may include a composition controller
+struct ControllerResult {
+  controller: ICoreWebView2Controller,
+  composition_controller: Option<ICoreWebView2CompositionController>,
+  dcomp_state: Option<DCompState>,
+}
+
 impl Drop for InnerWebView {
   fn drop(&mut self) {
     let _ = unsafe { self.controller.Close() };
@@ -165,7 +172,7 @@ impl InnerWebView {
       unsafe {
         let _ = cr.controller
           .cast::<ICoreWebView2Controller4>()
-          .and_then(|c| c.SetAllowExternalDrop(false));
+          .and_then(|c: ICoreWebView2Controller4| c.SetAllowExternalDrop(false));
       }
       DragDropController::new(hwnd, handler)
     });
@@ -374,13 +381,6 @@ impl InnerWebView {
     }
 
     webview2_com::wait_with_pump(rx)?.map_err(Into::into)
-  }
-
-  /// Result of controller creation — may include a composition controller
-  struct ControllerResult {
-    controller: ICoreWebView2Controller,
-    composition_controller: Option<ICoreWebView2CompositionController>,
-    dcomp_state: Option<DCompState>,
   }
 
   #[inline]
