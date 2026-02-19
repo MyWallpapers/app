@@ -661,6 +661,13 @@ pub mod mouse_hook {
     /// Tracks whether WS_EX_TRANSPARENT is currently set on the WebView
     static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
 
+    // --- Double-click synthesis ---
+    // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd WM_LBUTTONDOWN events.
+    // We detect double-clicks manually using timing + position thresholds.
+    static LAST_CLICK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_CLICK_X: AtomicI32 = AtomicI32::new(0);
+    static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(0);
+
 
     /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
     /// When set, WindowFromPoint skips our window and clicks reach the icons behind.
@@ -840,14 +847,23 @@ pub mod mouse_hook {
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
                         // ── Fast path: STATE_NATIVE ──
-                        // WebView is WS_EX_TRANSPARENT so real hardware events reach
-                        // SysListView32 natively. This preserves Drag & Drop (OLE Drag
-                        // needs real events) and double-click detection by Windows.
+                        // PostMessage ALL events to SysListView32 for complete icon interaction.
+                        // SetCapture is per-thread and doesn't route events cross-process,
+                        // so CallNextHookEx alone cannot deliver moves/mouseup to Explorer.
+                        // We must explicitly forward every event via PostMessage.
                         if state == STATE_NATIVE {
                             if is_up {
+                                forward_to_syslistview(msg, pt);
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
+                            } else if msg == WM_MOUSEMOVE {
+                                forward_to_syslistview(msg, pt);
+                            } else if is_down {
+                                // Additional mousedown while in native mode (e.g. right-click during drag)
+                                forward_to_syslistview(msg, pt);
                             }
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                            // Consume the event — SysListView32 gets it via PostMessage.
+                            // CallNextHookEx would deliver to the WebView (wrong target).
+                            return LRESULT(1);
                         }
 
                         // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
@@ -902,12 +918,42 @@ pub mod mouse_hook {
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                // PostMessage guarantees SysListView32 receives the click
-                                // (WS_EX_TRANSPARENT doesn't work for child window hit-testing).
-                                // SysListView32 will call SetCapture, so subsequent real events
-                                // (via CallNextHookEx in STATE_NATIVE) reach it for drag & drop.
+
+                                // Double-click synthesis for left button:
+                                // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd events.
+                                // Detect manually: if two LBUTTONDOWNs occur within GetDoubleClickTime
+                                // and within SM_CXDOUBLECLK/SM_CYDOUBLECLK pixels, send DBLCLK instead.
+                                if msg == WM_LBUTTONDOWN {
+                                    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let prev_time = LAST_CLICK_TIME.load(Ordering::Relaxed);
+                                    let prev_x = LAST_CLICK_X.load(Ordering::Relaxed);
+                                    let prev_y = LAST_CLICK_Y.load(Ordering::Relaxed);
+                                    let dbl_time = GetDoubleClickTime() as u64;
+                                    let cx = GetSystemMetrics(SM_CXDOUBLECLK);
+                                    let cy = GetSystemMetrics(SM_CYDOUBLECLK);
+
+                                    if now - prev_time <= dbl_time
+                                        && (pt.x - prev_x).abs() <= cx
+                                        && (pt.y - prev_y).abs() <= cy
+                                    {
+                                        // Second click within threshold → send WM_LBUTTONDBLCLK
+                                        log::info!("[hook] double-click detected ({},{})", pt.x, pt.y);
+                                        forward_to_syslistview(0x0203, pt); // WM_LBUTTONDBLCLK
+                                        LAST_CLICK_TIME.store(0, Ordering::Relaxed);
+                                        return LRESULT(1);
+                                    }
+                                    LAST_CLICK_TIME.store(now, Ordering::Relaxed);
+                                    LAST_CLICK_X.store(pt.x, Ordering::Relaxed);
+                                    LAST_CLICK_Y.store(pt.y, Ordering::Relaxed);
+                                }
+
+                                // PostMessage the mousedown for guaranteed delivery
                                 forward_to_syslistview(msg, pt);
-                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                                return LRESULT(1);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
                             set_webview_click_through(wv, false);
