@@ -684,11 +684,13 @@ pub mod mouse_hook {
                                 send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
                             }
                             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                let delta = info.mouseData & 0xFFFF0000;
+                                // SendMouseInput expects GET_WHEEL_DELTA_WPARAM — the raw signed
+                                // delta value (120/-120), not the high-word-packed wParam.
+                                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
                                 let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
                                 let ok = send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
                                 log::info!("[INPUT] WHEEL delta={} screen=({},{}) ok={} horiz={}",
-                                    (info.mouseData >> 16) as i16, pt.x, pt.y, ok, msg == WM_MOUSEHWHEEL);
+                                    delta as i32, pt.x, pt.y, ok, msg == WM_MOUSEHWHEEL);
                             }
                             _ => {}
                         }
