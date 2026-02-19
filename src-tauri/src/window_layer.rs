@@ -185,13 +185,25 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             return Err("Desktop detection failed: neither 24H2 nor Legacy architecture found.".to_string());
         }
 
-        // Trouver SysListView32
+        // Trouver SysListView32 — scan all descendants (not just direct children)
+        // On Win11 24H2+, SysListView32 may be nested deeper under SHELLDLL_DefView
         let mut syslistview = HWND::default();
-        if let Ok(slv) = FindWindowExW(shell_view, HWND::default(), windows::core::w!("SysListView32"), None) {
-            if !slv.is_invalid() {
-                syslistview = slv;
+        unsafe extern "system" fn enum_child_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let mut class_name = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut class_name);
+            let name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if name == "SysListView32" {
+                let ptr = lparam.0 as *mut HWND;
+                *ptr = hwnd;
+                return BOOL(0); // Stop enumeration
             }
+            BOOL(1)
         }
+        let _ = EnumChildWindows(
+            shell_view,
+            Some(enum_child_cb),
+            LPARAM(&mut syslistview as *mut _ as isize),
+        );
 
         Ok(DesktopDetection { is_24h2, target_parent, shell_view, os_workerw, syslistview })
     }
@@ -515,38 +527,59 @@ pub mod mouse_hook {
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
         use windows::core::Interface;
+        use std::cell::RefCell;
 
         let slv_raw = get_syslistview_hwnd();
         if slv_raw == 0 { return false; }
         let slv = HWND(slv_raw as *mut core::ffi::c_void);
 
-        // Get IAccessible directly from SysListView32 client area.
-        // This bypasses the global AccessibleObjectFromPoint hit-test which
-        // composition mode WebView intercepts via its accessibility proxy.
-        let mut raw_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-        let objid_client: u32 = 0xFFFFFFFC; // OBJID_CLIENT
-        if AccessibleObjectFromWindow(slv, objid_client, &IAccessible::IID, &mut raw_ptr).is_err()
-            || raw_ptr.is_null()
-        {
-            return false;
+        // Cache the COM proxy thread-locally to avoid expensive cross-process
+        // AccessibleObjectFromWindow calls on every mouse move.
+        thread_local! {
+            static CACHED_ACC: RefCell<Option<(isize, IAccessible)>> = RefCell::new(None);
         }
-        let acc: IAccessible = IAccessible::from_raw(raw_ptr);
 
-        // accHitTest checks if screen point (x,y) is over a child item (icon).
-        // Returns VT_I4(0) = background, VT_I4(>0) = icon child ID, VT_DISPATCH = icon object.
-        match acc.accHitTest(x as i32, y as i32) {
-            Ok(hit) => {
-                if let Ok(val) = i32::try_from(&hit) {
-                    val > 0
-                } else {
-                    // Only VT_DISPATCH (=9) means a child accessible object (icon).
-                    // VT_EMPTY, VT_NULL, or any other type = not an icon.
-                    let vt = unsafe { hit.as_raw().Anonymous.Anonymous.vt };
-                    vt == 9 // VT_DISPATCH
+        CACHED_ACC.with(|cache| {
+            let mut cache_mut = cache.borrow_mut();
+
+            // Refresh cache if empty or Explorer restarted (HWND changed)
+            if cache_mut.is_none() || cache_mut.as_ref().unwrap().0 != slv_raw {
+                let mut raw_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+                let objid_client: u32 = 0xFFFFFFFC; // OBJID_CLIENT
+                if AccessibleObjectFromWindow(slv, objid_client, &IAccessible::IID, &mut raw_ptr).is_err()
+                    || raw_ptr.is_null()
+                {
+                    *cache_mut = None;
+                    return false;
                 }
+                let acc: IAccessible = IAccessible::from_raw(raw_ptr);
+                *cache_mut = Some((slv_raw, acc));
             }
-            Err(_) => false,
-        }
+
+            if let Some((_, acc)) = cache_mut.as_ref() {
+                // accHitTest checks if screen point (x,y) is over a child item (icon).
+                // Returns VT_I4(0) = background, VT_I4(>0) = icon child ID, VT_DISPATCH = icon object.
+                match acc.accHitTest(x, y) {
+                    Ok(hit) => {
+                        if let Ok(val) = i32::try_from(&hit) {
+                            val > 0
+                        } else {
+                            // Only VT_DISPATCH (=9) means a child accessible object (icon).
+                            // VT_EMPTY, VT_NULL, or any other type = not an icon.
+                            let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                            vt == 9 // VT_DISPATCH
+                        }
+                    }
+                    Err(_) => {
+                        // COM proxy invalid (Explorer restarted?) — clear cache
+                        *cache_mut = None;
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        })
     }
 
     // HWND cache — avoids recomputing is_over_desktop when cursor stays over the same window.
@@ -610,39 +643,43 @@ pub mod mouse_hook {
     /// Forward a mouse event to the WebView via SendMouseInput dispatch.
     #[inline]
     unsafe fn forward_to_webview(msg: u32, info: &MSLLHOOKSTRUCT, client_pt: windows::Win32::Foundation::POINT) {
+        // Clamp to non-negative — WebView2 rejects negative coords with 0x80070057
+        let x = client_pt.x.max(0);
+        let y = client_pt.y.max(0);
+
         match msg {
             WM_MOUSEMOVE => {
                 let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
-                send_input(MOUSE_MOVE, vk, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_MOVE, vk, 0, x, y);
             }
             WM_LBUTTONDOWN => {
                 DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
-                send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, x, y);
             }
             WM_LBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, x, y);
             }
             WM_RBUTTONDOWN => {
                 DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
-                send_input(MOUSE_RBUTTON_DOWN, VK_RBUTTON, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_RBUTTON_DOWN, VK_RBUTTON, 0, x, y);
             }
             WM_RBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                send_input(MOUSE_RBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_RBUTTON_UP, VK_NONE, 0, x, y);
             }
             WM_MBUTTONDOWN => {
                 DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
-                send_input(MOUSE_MBUTTON_DOWN, VK_MBUTTON, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_MBUTTON_DOWN, VK_MBUTTON, 0, x, y);
             }
             WM_MBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, x, y);
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                 let delta = (info.mouseData >> 16) as i16 as i32 as u32;
                 let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
+                send_input(kind, VK_NONE, delta, x, y);
             }
             _ => {}
         }
@@ -694,7 +731,8 @@ pub mod mouse_hook {
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
-                                send_input(MOUSE_LEAVE, VK_NONE, 0, pt.x, pt.y);
+                                // Send (0,0) — WebView2 rejects negative/out-of-bounds coords (0x80070057)
+                                send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
