@@ -417,7 +417,7 @@ pub mod mouse_hook {
 
         // Mark Chrome HWND as our target (readable cross-process via GetPropW)
         let prop_ok = SetPropW(cw, windows::core::w!("MWP_T"), HANDLE(1 as *mut _));
-        log::info!("SetPropW(MWP_T) on Chrome HWND 0x{:X}: ok={}", cw.0 as isize, prop_ok.as_bool());
+        log::info!("SetPropW(MWP_T) on Chrome HWND 0x{:X}: ok={}", cw.0 as isize, prop_ok.is_ok());
 
         // Find the hook DLL next to the executable
         let dll_path = match std::env::current_exe() {
