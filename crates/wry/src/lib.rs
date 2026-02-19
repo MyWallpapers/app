@@ -2361,6 +2361,45 @@ pub unsafe fn send_mouse_input_raw(
   Ok(())
 }
 
+/// Set the WebView2 controller bounds directly via a raw composition controller pointer.
+///
+/// This is needed when the HWND is converted to WS_CHILD after creation, because
+/// wry's normal WM_SIZE subclass handler is only installed for non-child windows.
+///
+/// # Safety
+/// `comp_ptr` must be a valid `ICoreWebView2CompositionController` COM pointer.
+#[cfg(target_os = "windows")]
+pub unsafe fn set_controller_bounds_raw(
+  comp_ptr: isize,
+  width: i32,
+  height: i32,
+) -> std::result::Result<(), String> {
+  use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2CompositionController;
+  use windows::Win32::Foundation::RECT;
+  use windows::core::Interface;
+
+  if comp_ptr == 0 {
+    return Err("Null composition controller".to_string());
+  }
+
+  let comp = std::mem::ManuallyDrop::new(
+    ICoreWebView2CompositionController::from_raw(comp_ptr as *mut std::ffi::c_void)
+  );
+
+  // QI for ICoreWebView2Controller (parent interface)
+  let controller: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller =
+    comp.cast().map_err(|e| format!("QI for ICoreWebView2Controller failed: {}", e))?;
+
+  controller.SetBounds(RECT {
+    left: 0,
+    top: 0,
+    right: width,
+    bottom: height,
+  }).map_err(|e| format!("SetBounds failed: {}", e))?;
+
+  Ok(())
+}
+
 /// Additional methods on `WebView` that are specific to Linux.
 #[cfg(gtk)]
 pub trait WebViewExtUnix: Sized {

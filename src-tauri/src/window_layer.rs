@@ -112,6 +112,8 @@ struct DesktopDetection {
     shell_view: windows::Win32::Foundation::HWND,
     os_workerw: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
+    parent_width: i32,
+    parent_height: i32,
 }
 
 /// Détecte l'architecture desktop Windows (24H2 ou Legacy) et retourne tous les HWNDs
@@ -205,7 +207,15 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             LPARAM(&mut syslistview as *mut _ as isize),
         );
 
-        Ok(DesktopDetection { is_24h2, target_parent, shell_view, os_workerw, syslistview })
+        // Get parent client rect dimensions for SetBounds
+        let mut parent_rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(target_parent, &mut parent_rect);
+
+        Ok(DesktopDetection {
+            is_24h2, target_parent, shell_view, os_workerw, syslistview,
+            parent_width: parent_rect.right,
+            parent_height: parent_rect.bottom,
+        })
     }
 }
 
@@ -221,7 +231,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 /// 7. SWP_FRAMECHANGED forces WM_NCCALCSIZE recalculation → non-client area collapses to 0px
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::Win32::Graphics::Dwm::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -290,26 +300,19 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
 
-        // ── Size: GetClientRect of parent (pure display area, no DWM overhead) ──
+        // ── Size: use parent dimensions from detection ──
         // SWP_FRAMECHANGED forces WM_NCCALCSIZE recalculation.
         // With WS_THICKFRAME gone, non-client area = 0px → Window Rect == Client Rect.
-        let mut parent_rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetClientRect(detection.target_parent, &mut parent_rect);
         let _ = SetWindowPos(our_hwnd, HWND::default(),
-            0, 0, parent_rect.right, parent_rect.bottom,
+            0, 0, detection.parent_width, detection.parent_height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-        // ── Force WebView2 bounds update ──
-        // Tauri/wry set WebView2 controller bounds during init based on the ORIGINAL
-        // client area (offset by WS_THICKFRAME's ~7px). After stripping styles and
-        // resizing, the client area expanded but WebView2 bounds are stale.
-        // Sending WM_SIZE triggers wry's resize handler → put_Bounds() with correct rect.
-        let w = parent_rect.right as u16 as u32;
-        let h = parent_rect.bottom as u16 as u32;
-        let _ = SendMessageW(our_hwnd, WM_SIZE, WPARAM(0), LPARAM(((h << 16) | w) as isize));
+        // NOTE: WebView2 bounds (SetBounds) are updated separately after this function
+        // returns, via wry::set_controller_bounds_raw() in ensure_in_worker_w.
+        // wry's WM_SIZE subclass is NOT installed for WS_CHILD windows.
 
         log::info!("Injection complete: parent={}x{}, HWND at (0,0)",
-            parent_rect.right, parent_rect.bottom);
+            detection.parent_width, detection.parent_height);
     }
 }
 
@@ -338,10 +341,21 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     apply_injection(our_hwnd, &detection);
 
     // Extract composition controller from wry (stored during WebView2 creation)
+    let parent_width = detection.parent_width;
+    let parent_height = detection.parent_height;
     let comp_ptr = wry::get_last_composition_controller_ptr();
     if comp_ptr != 0 {
         mouse_hook::set_comp_controller_ptr(comp_ptr);
         info!("CompositionController ready: 0x{:X}", comp_ptr);
+        // Fix WebView2 bounds after style stripping.
+        // wry's WM_SIZE subclass is NOT installed for WS_CHILD windows, so
+        // we must call SetBounds directly on the controller.
+        unsafe {
+            match wry::set_controller_bounds_raw(comp_ptr, parent_width, parent_height) {
+                Ok(()) => info!("WebView2 bounds set to {}x{}", parent_width, parent_height),
+                Err(e) => warn!("Failed to set WebView2 bounds: {}", e),
+            }
+        }
     } else {
         // WebView2 may create the controller slightly after window setup — retry briefly
         std::thread::spawn(move || {
@@ -351,6 +365,12 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                 if ptr != 0 {
                     mouse_hook::set_comp_controller_ptr(ptr);
                     log::info!("CompositionController discovered: 0x{:X}", ptr);
+                    unsafe {
+                        match wry::set_controller_bounds_raw(ptr, parent_width, parent_height) {
+                            Ok(()) => log::info!("WebView2 bounds set to {}x{}", parent_width, parent_height),
+                            Err(e) => log::warn!("Failed to set WebView2 bounds: {}", e),
+                        }
+                    }
                     return;
                 }
             }
@@ -402,8 +422,14 @@ pub fn try_refresh_desktop() -> bool {
             // Ré-injecter dans la nouvelle hiérarchie
             apply_injection(our_hwnd, &detection);
 
-            // Composition controller COM pointer survives Explorer restarts
-            // (it's owned by our process, not Explorer's)
+            // Update WebView2 bounds after re-injection
+            let comp_ptr = mouse_hook::get_comp_controller_ptr();
+            if comp_ptr != 0 {
+                unsafe {
+                    let _ = wry::set_controller_bounds_raw(
+                        comp_ptr, detection.parent_width, detection.parent_height);
+                }
+            }
 
             if detection.is_24h2 {
                 info!("Desktop recovered (24H2).");
@@ -509,7 +535,7 @@ pub mod mouse_hook {
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
     pub fn set_comp_controller_ptr(ptr: isize) { COMP_CONTROLLER_PTR.store(ptr, Ordering::SeqCst); }
-    fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
+    pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
 
     /// Queue a mouse event for dispatch on the UI thread via PostMessage.
     /// SendMouseInput is STA-bound and must be called from the UI thread.
@@ -711,30 +737,39 @@ pub mod mouse_hook {
     static OVER_ICON: AtomicBool = AtomicBool::new(false);
     /// Tick counter for throttled icon hover checks (every 8th MOUSE_MOVE)
     static ICON_CHECK_TICK: AtomicU32 = AtomicU32::new(0);
-    /// Tracks whether the WebView HWND is currently disabled (EnableWindow FALSE).
-    /// When disabled, WindowFromPoint skips our window → system dispatches directly
-    /// to SysListView32. This enables native DragDetect, double-click, and all
-    /// icon interactions without PostMessage or WS_EX_TRANSPARENT.
-    static WV_DISABLED: AtomicBool = AtomicBool::new(false);
 
-    /// Disable the WebView HWND for hit-testing bypass.
-    /// WindowFromPoint skips disabled windows → events flow to SysListView32 natively.
-    /// DirectComposition rendering is unaffected (visual output continues).
+    /// Forward a mouse event to SysListView32 via PostMessage.
+    /// Converts screen coords to SysListView32 client coords and posts the appropriate message.
+    /// Used when the cursor is over a desktop icon — we consume the original event (LRESULT(1))
+    /// and re-deliver it to SysListView32 so native icon interactions work.
     #[inline]
-    unsafe fn disable_webview(wv: HWND) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-        if !WV_DISABLED.swap(true, Ordering::Relaxed) {
-            let _ = EnableWindow(wv, false);
-        }
-    }
+    unsafe fn forward_to_syslistview(msg: u32, info: &MSLLHOOKSTRUCT) {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        let slv_raw = get_syslistview_hwnd();
+        if slv_raw == 0 { return; }
+        let slv = HWND(slv_raw as *mut core::ffi::c_void);
 
-    /// Re-enable the WebView HWND for normal interaction.
-    #[inline]
-    unsafe fn enable_webview(wv: HWND) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-        if WV_DISABLED.swap(false, Ordering::Relaxed) {
-            let _ = EnableWindow(wv, true);
-        }
+        let mut client_pt = info.pt;
+        let _ = ScreenToClient(slv, &mut client_pt);
+        let lparam = LPARAM(((client_pt.x as i16 as u16 as u32) | ((client_pt.y as i16 as u16 as u32) << 16)) as isize);
+
+        // Map LL hook messages to standard window messages with button-state wParam
+        let (wm, wp) = match msg {
+            WM_LBUTTONDOWN => (WM_LBUTTONDOWN, WPARAM(0x0001)),  // MK_LBUTTON
+            WM_LBUTTONUP   => (WM_LBUTTONUP,   WPARAM(0)),
+            WM_RBUTTONDOWN => (WM_RBUTTONDOWN, WPARAM(0x0002)),  // MK_RBUTTON
+            WM_RBUTTONUP   => (WM_RBUTTONUP,   WPARAM(0)),
+            WM_MOUSEMOVE   => {
+                // Include button state for drag detection
+                let mut mk: usize = 0;
+                if DRAG_VK.load(Ordering::Relaxed) == VK_LBUTTON as isize { mk |= 0x0001; }
+                if DRAG_VK.load(Ordering::Relaxed) == VK_RBUTTON as isize { mk |= 0x0002; }
+                (WM_MOUSEMOVE, WPARAM(mk))
+            }
+            _ => return,
+        };
+
+        let _ = PostMessageW(slv, wm, wp, lparam);
     }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
@@ -872,18 +907,16 @@ pub mod mouse_hook {
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
                         // ── Fast path: STATE_NATIVE ──
-                        // WebView is disabled (EnableWindow FALSE) → WindowFromPoint skips it.
-                        // System dispatches real hardware events directly to SysListView32.
-                        // This enables native DragDetect, SetCapture, OLE Drag & Drop,
-                        // double-click detection — all without PostMessage or synthesis.
+                        // All events are forwarded to SysListView32 via PostMessage and
+                        // consumed (LRESULT(1)) so the WebView never sees them.
+                        // This enables clicks, double-click, hover, and drag & drop.
                         if state == STATE_NATIVE {
+                            forward_to_syslistview(msg, &info);
                             if is_up {
+                                DRAG_VK.store(0, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
-                                // Don't re-enable here — defer to IDLE handler when
-                                // OVER_ICON transitions to false (mouseup dispatch must
-                                // reach SysListView32 while window is still disabled).
                             }
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                            return LRESULT(1);
                         }
 
                         // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
@@ -904,7 +937,6 @@ pub mod mouse_hook {
 
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
-                            enable_webview(wv);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
@@ -921,42 +953,41 @@ pub mod mouse_hook {
                                 HOVER_Y.store(pt.y, Ordering::Relaxed);
                                 NEEDS_ICON_CHECK.store(true, Ordering::Relaxed);
                             }
-                            // Sync enable/disable with OVER_ICON from background thread.
-                            // When disabled, system dispatches moves to SysListView32 →
-                            // native hover highlighting without PostMessage.
-                            let icon_flag = OVER_ICON.load(Ordering::Relaxed);
-                            if icon_flag {
-                                disable_webview(wv);
-                            } else {
-                                enable_webview(wv);
+                            // If hovering over icon, forward move to SysListView32
+                            // for native hover highlighting.
+                            if OVER_ICON.load(Ordering::Relaxed) {
+                                forward_to_syslistview(msg, &info);
+                                return LRESULT(1);
                             }
                         }
 
                         // State transition on mousedown — synchronous check required.
                         if is_down {
                             let over_icon = is_mouse_over_desktop_icon(pt.x, pt.y);
-                            log::info!("[hook] mousedown ({},{}) hwnd=0x{:X} desktop={} icon={} disabled={}",
-                                pt.x, pt.y, hwnd_under.0 as isize, is_over_desktop, over_icon,
-                                WV_DISABLED.load(Ordering::Relaxed));
+                            log::info!("[hook] mousedown ({},{}) hwnd=0x{:X} desktop={} icon={}",
+                                pt.x, pt.y, hwnd_under.0 as isize, is_over_desktop, over_icon);
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
-                                // Disable WebView BEFORE CallNextHookEx — system dispatch
-                                // skips disabled windows → event goes to SysListView32.
-                                // All native mechanisms work: DragDetect, SetCapture, double-click.
-                                disable_webview(wv);
+                                // Track which button for MK_* flags in move events
+                                if msg == WM_LBUTTONDOWN { DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed); }
+                                else if msg == WM_RBUTTONDOWN { DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed); }
+                                // Forward mousedown to SysListView32 and consume original.
+                                // On 24H2, our WebView HWND intercepts all events from the
+                                // DComp visual tree — CallNextHookEx sends to WebView, not icons.
+                                // PostMessage delivers directly to SysListView32's message queue.
+                                forward_to_syslistview(msg, &info);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                                return LRESULT(1);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
-                            enable_webview(wv);
                             HOOK_STATE.store(STATE_WEB, Ordering::Relaxed);
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        // If hovering over icon (WebView disabled), let system handle.
-                        // Events go to SysListView32 natively via CallNextHookEx.
+                        // If hovering over icon in IDLE, forward to SysListView32.
                         if OVER_ICON.load(Ordering::Relaxed) {
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                            forward_to_syslistview(msg, &info);
+                            return LRESULT(1);
                         }
 
                         // Forward to WebView (hover moves in IDLE + first click IDLE→WEB)
