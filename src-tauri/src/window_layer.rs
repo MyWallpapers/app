@@ -221,18 +221,25 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             return;
         }
 
-        // Strip all frame styles — WS_POPUP, WS_THICKFRAME (resize border),
-        // WS_CAPTION, WS_BORDER. Tauri may leave WS_THICKFRAME even with decorations:false.
+        // 1. Strip ALL border styles — classic and extended
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
         style &= !(WS_POPUP.0 as i32);
         style &= !(WS_THICKFRAME.0 as i32);
         style &= !(WS_CAPTION.0 as i32);
+        style &= !(WS_BORDER.0 as i32);
         style |= WS_CHILD.0 as i32;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
 
+        // 2. Strip extended border styles (invisible shadows from Windows DWM)
+        let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE);
+        ex_style &= !(WS_EX_CLIENTEDGE.0 as i32);
+        ex_style &= !(WS_EX_WINDOWEDGE.0 as i32);
+        ex_style &= !(WS_EX_DLGMODALFRAME.0 as i32);
+        let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style);
+
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // Step 1: Z-order placement only (SWP_NOMOVE|SWP_NOSIZE to not touch geometry)
+        // 3. Z-order placement (SWP_NOMOVE|SWP_NOSIZE — geometry untouched)
         if detection.is_24h2 {
             let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
@@ -243,14 +250,11 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
 
-        // Step 2: Position + size — separate call to avoid z-order interference.
-        // Use GetWindowRect on parent (screen coords, DPI-correct) for the true size.
-        // Position at (0,0) in parent-relative coords to eliminate invisible border offset.
+        // 4. Position + size using GetClientRect (pure display area, no border overflow)
         let mut parent_rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetWindowRect(detection.target_parent, &mut parent_rect);
-        let w = parent_rect.right - parent_rect.left;
-        let h = parent_rect.bottom - parent_rect.top;
-        let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, w, h,
+        let _ = GetClientRect(detection.target_parent, &mut parent_rect);
+        let _ = SetWindowPos(our_hwnd, HWND::default(),
+            0, 0, parent_rect.right, parent_rect.bottom,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 }
@@ -367,7 +371,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -657,6 +661,12 @@ pub mod mouse_hook {
     /// Tracks whether WS_EX_TRANSPARENT is currently set on the WebView
     static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
 
+    /// Double-click detection — track last click time and position to synthesize
+    /// WM_LBUTTONDBLCLK since we consume raw clicks via PostMessage.
+    static LAST_CLICK_TIME: AtomicU64 = AtomicU64::new(0);
+    static LAST_CLICK_X: AtomicI32 = AtomicI32::new(0);
+    static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(0);
+
     /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
     /// When set, WindowFromPoint skips our window and clicks reach the icons behind.
     /// WebView2 composition mode renders via DirectComposition which overlays HWND Z-order,
@@ -829,12 +839,41 @@ pub mod mouse_hook {
                         let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
+                        // ── Double-click synthesis ──
+                        // Since we consume raw clicks via PostMessage, Windows can't
+                        // detect double-clicks. We track timing ourselves.
+                        let mut actual_msg = msg;
+                        if is_down {
+                            use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_millis() as u64;
+                            let dbl_time = GetDoubleClickTime() as u64;
+                            let dx = (pt.x - LAST_CLICK_X.load(Ordering::Relaxed)).abs();
+                            let dy = (pt.y - LAST_CLICK_Y.load(Ordering::Relaxed)).abs();
+                            let cx = GetSystemMetrics(SM_CXDOUBLECLK);
+                            let cy = GetSystemMetrics(SM_CYDOUBLECLK);
+                            if now - LAST_CLICK_TIME.load(Ordering::Relaxed) <= dbl_time
+                                && dx <= cx / 2 && dy <= cy / 2
+                            {
+                                if msg == WM_LBUTTONDOWN { actual_msg = 0x0203; } // WM_LBUTTONDBLCLK
+                                else if msg == WM_RBUTTONDOWN { actual_msg = 0x0206; } // WM_RBUTTONDBLCLK
+                                else if msg == WM_MBUTTONDOWN { actual_msg = 0x0209; } // WM_MBUTTONDBLCLK
+                                // Reset so triple-click doesn't re-trigger dblclk
+                                LAST_CLICK_TIME.store(0, Ordering::Relaxed);
+                            } else {
+                                LAST_CLICK_TIME.store(now, Ordering::Relaxed);
+                            }
+                            LAST_CLICK_X.store(pt.x, Ordering::Relaxed);
+                            LAST_CLICK_Y.store(pt.y, Ordering::Relaxed);
+                        }
+
                         // ── Fast path: STATE_NATIVE — forward to SysListView32 ──
                         // We consume the event and PostMessage it directly to SysListView32
                         // because CallNextHookEx delivers clicks to the WebView (on top in
                         // DirectComposition Z-order), not to the icon window behind it.
                         if state == STATE_NATIVE {
-                            forward_to_syslistview(msg, pt);
+                            forward_to_syslistview(if is_down { actual_msg } else { msg }, pt);
                             if is_up {
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                                 set_webview_click_through(wv, false);
@@ -891,8 +930,8 @@ pub mod mouse_hook {
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                // Forward click directly to SysListView32 via PostMessage
-                                forward_to_syslistview(msg, pt);
+                                // Forward click (or dblclk) directly to SysListView32
+                                forward_to_syslistview(actual_msg, pt);
                                 return LRESULT(1); // Consume — forwarded directly
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
