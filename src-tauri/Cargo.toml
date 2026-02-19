@@ -44,6 +44,11 @@ features = [
     "Win32_System_LibraryLoader",
 ]
 
+# Direct dependency on wry for WebViewExtWindows + composition_controller access
+[target.'cfg(target_os = "windows")'.dependencies]
+wry = "0.53.5"
+webview2-com = "0.38"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 
@@ -51,6 +56,10 @@ objc = "0.2"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 devtools = ["tauri/devtools"]
+
+# Use local wry fork with composition mode support (SendMouseInput)
+[patch.crates-io]
+wry = { path = "../crates/wry" }
 
 [profile.release]
 opt-level = 3

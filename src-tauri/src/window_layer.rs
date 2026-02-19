@@ -248,8 +248,26 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     apply_injection(our_hwnd, &detection);
 
-    // Discover Chrome_RenderWidgetHostHWND (Chromium creates it after first navigation)
-    mouse_hook::start_chrome_widget_discovery(our_hwnd);
+    // Extract composition controller from wry (stored during WebView2 creation)
+    let comp_ptr = wry::get_last_composition_controller_ptr();
+    if comp_ptr != 0 {
+        mouse_hook::set_comp_controller_ptr(comp_ptr);
+        info!("CompositionController ready: 0x{:X}", comp_ptr);
+    } else {
+        // WebView2 may create the controller slightly after window setup — retry briefly
+        std::thread::spawn(move || {
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let ptr = wry::get_last_composition_controller_ptr();
+                if ptr != 0 {
+                    mouse_hook::set_comp_controller_ptr(ptr);
+                    log::info!("CompositionController discovered: 0x{:X}", ptr);
+                    return;
+                }
+            }
+            log::warn!("CompositionController not found after 3s — mouse forwarding disabled");
+        });
+    }
 
     if detection.is_24h2 {
         info!("Moteur Windows 11 24H2 activé.");
@@ -291,9 +309,8 @@ pub fn try_refresh_desktop() -> bool {
             // Ré-injecter dans la nouvelle hiérarchie
             apply_injection(our_hwnd, &detection);
 
-            // Re-discover Chrome_RenderWidgetHostHWND (may have changed after Explorer restart)
-            mouse_hook::set_chrome_widget_hwnd(0);
-            mouse_hook::start_chrome_widget_discovery(our_hwnd);
+            // Composition controller COM pointer survives Explorer restarts
+            // (it's owned by our process, not Explorer's)
 
             if detection.is_24h2 {
                 info!("Desktop recovered (24H2).");
@@ -315,17 +332,29 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
-    use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
-    // Constants not re-exported by WindowsAndMessaging — define manually
-    const WM_MOUSELEAVE: u32 = 0x02A3;
-    const MK_LBUTTON: usize = 0x0001;
-    const MK_RBUTTON: usize = 0x0002;
-    const MK_MBUTTON: usize = 0x0010;
+    // COREWEBVIEW2_MOUSE_EVENT_KIND values (from WebView2 IDL)
+    const MOUSE_MOVE: i32 = 0x0200;         // WM_MOUSEMOVE
+    const MOUSE_LBUTTON_DOWN: i32 = 0x0201; // WM_LBUTTONDOWN
+    const MOUSE_LBUTTON_UP: i32 = 0x0202;   // WM_LBUTTONUP
+    const MOUSE_RBUTTON_DOWN: i32 = 0x0204; // WM_RBUTTONDOWN
+    const MOUSE_RBUTTON_UP: i32 = 0x0205;   // WM_RBUTTONUP
+    const MOUSE_MBUTTON_DOWN: i32 = 0x0207; // WM_MBUTTONDOWN
+    const MOUSE_MBUTTON_UP: i32 = 0x0208;   // WM_MBUTTONUP
+    const MOUSE_WHEEL: i32 = 0x020A;        // WM_MOUSEWHEEL
+    const MOUSE_HWHEEL: i32 = 0x020E;       // WM_MOUSEHWHEEL
+    const MOUSE_LEAVE: i32 = 0x02A3;        // WM_MOUSELEAVE
+
+    // COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS values
+    const VK_NONE: i32 = 0x0;
+    const VK_LBUTTON: i32 = 0x1;
+    const VK_RBUTTON: i32 = 0x2;
+    const VK_MBUTTON: i32 = 0x10;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -333,13 +362,13 @@ pub mod mouse_hook {
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
 
-    /// Chrome_RenderWidgetHostHWND — Chromium's internal input HWND inside WebView2.
-    /// PostMessage to this HWND goes through Chromium's native input pipeline,
-    /// enabling CSS :hover, scroll, click, drag without any JS adaptation.
-    static CHROME_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
+    /// Raw COM pointer to ICoreWebView2CompositionController.
+    /// Set from the main thread after WebView2 creation.
+    /// Used by the hook thread to call SendMouseInput.
+    static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
 
-    /// MK_* flag of the button that initiated the current drag (used for WM_MOUSEMOVE wparam)
-    static DRAG_BUTTON_MK: AtomicU16 = AtomicU16::new(0);
+    /// MK_* flag of the button that initiated the current drag
+    static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
 
     /// AppHandle for visibility watchdog events (wallpaper-visibility)
     static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
@@ -349,20 +378,8 @@ pub mod mouse_hook {
     const STATE_NATIVE: u8 = 1;
     const STATE_WEB: u8 = 2;
 
-    /// Tracks whether cursor was over desktop on previous move (for WM_MOUSELEAVE)
+    /// Tracks whether cursor was over desktop on previous move (for SendMouseInput LEAVE)
     static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
-
-    /// Debug: log first unknown window encounter
-    static UNKNOWN_HWND_LOGGED: AtomicBool = AtomicBool::new(false);
-
-    /// In-process hook: tracks whether an explicit leave is pending
-    static EXPLICIT_LEAVE: AtomicBool = AtomicBool::new(false);
-    /// In-process hook: suppress count (diagnostic)
-    static INPROC_SUPPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
-    /// In-process hook: heartbeat — incremented on EVERY message processed by hook
-    static INPROC_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
-    /// Whether the in-process hook is active (vs DLL-based cross-process hook)
-    static INPROC_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -379,213 +396,25 @@ pub mod mouse_hook {
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
-    fn get_chrome_widget_hwnd() -> isize { CHROME_WIDGET_HWND.load(Ordering::SeqCst) }
-    pub fn set_chrome_widget_hwnd(hwnd: isize) { CHROME_WIDGET_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_comp_controller_ptr(ptr: isize) { COMP_CONTROLLER_PTR.store(ptr, Ordering::SeqCst); }
+    fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
 
-    /// Finds Chrome_RenderWidgetHostHWND inside the WebView2 HWND hierarchy.
-    /// This is Chromium's internal input HWND — PostMessage to it goes through
-    /// the native input pipeline (CSS :hover, scroll, click, drag all work).
-    pub fn discover_chrome_widget(webview_hwnd: HWND) -> Option<HWND> {
-        struct SearchData { found: HWND }
-        let mut data = SearchData { found: HWND::default() };
-
-        unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let mut cn = [0u16; 64];
-            let len = GetClassNameW(hwnd, &mut cn);
-            let class = String::from_utf16_lossy(&cn[..len as usize]);
-            if class == "Chrome_RenderWidgetHostHWND" {
-                let d = &mut *(lparam.0 as *mut SearchData);
-                d.found = hwnd;
-                return BOOL(0); // Stop enumeration
-            }
-            BOOL(1) // Continue
-        }
-
-        unsafe {
-            let _ = EnumChildWindows(webview_hwnd, Some(enum_cb), LPARAM(&mut data as *mut SearchData as isize));
-        }
-
-        if data.found.is_invalid() { None } else { Some(data.found) }
-    }
-
-    /// In-process WH_GETMESSAGE hook proc — used when Chrome_RenderWidgetHostHWND
-    /// is in our Tauri process. Runs in Chrome's thread context but accesses our
-    /// process globals directly via atomics. No DLL injection needed.
-    unsafe extern "system" fn inproc_getmsg_hook(
-        code: i32, wparam: WPARAM, lparam: LPARAM,
-    ) -> LRESULT {
-        if code >= 0 && lparam.0 != 0 {
-            INPROC_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
-            let msg = &mut *(lparam.0 as *mut MSG);
-            if msg.message == WM_MOUSELEAVE {
-                let target = CHROME_WIDGET_HWND.load(Ordering::Relaxed);
-                if target != 0 && msg.hwnd.0 as isize == target {
-                    if EXPLICIT_LEAVE.swap(false, Ordering::Relaxed) {
-                        // Intentional leave from host — allow through
-                    } else {
-                        // Spurious WM_MOUSELEAVE from TrackMouseEvent — suppress
-                        msg.message = 0; // WM_NULL
-                        INPROC_SUPPRESS_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
-    }
-
-    /// Installs WH_GETMESSAGE hook on Chromium's UI thread to suppress spurious
-    /// WM_MOUSELEAVE from TrackMouseEvent.
-    ///
-    /// Two strategies depending on whether Chrome_RenderWidgetHostHWND is in our process:
-    /// - Same process: in-process hook via function pointer (no DLL injection needed)
-    /// - Different process: cross-process hook via companion DLL injection
-    unsafe fn install_chrome_msg_hook(cw: HWND) {
-        use windows::Win32::System::LibraryLoader::{LoadLibraryW, GetProcAddress};
-        use windows::core::PCWSTR;
-        use std::os::windows::ffi::OsStrExt;
-
-        // Mark Chrome HWND as our target (readable cross-process via GetPropW)
-        let prop_ok = SetPropW(cw, windows::core::w!("MWP_T"), HANDLE(1 as *mut _));
-        log::info!("SetPropW(MWP_T) on Chrome HWND 0x{:X}: ok={}", cw.0 as isize, prop_ok.is_ok());
-
-        // Determine which process owns Chrome_RenderWidgetHostHWND
-        let mut chrome_pid: u32 = 0;
-        let chrome_tid = GetWindowThreadProcessId(cw, Some(&mut chrome_pid));
-        let our_pid = std::process::id();
-        let same_process = chrome_pid == our_pid;
-
-        log::info!(
-            "Chrome HWND 0x{:X} — thread={} pid={} (our pid={}) same_process={}",
-            cw.0 as isize, chrome_tid, chrome_pid, our_pid, same_process
-        );
-
-        if chrome_tid == 0 {
-            log::warn!("Failed to get Chrome HWND thread ID — hover suppression disabled");
-            return;
-        }
-
-        // === Strategy 1: In-process hook (Chrome HWND in our Tauri process) ===
-        // No DLL injection needed — hook proc accesses our globals directly via atomics.
-        if same_process {
-            match SetWindowsHookExW(WH_GETMESSAGE, Some(inproc_getmsg_hook), None, chrome_tid) {
-                Ok(h) => {
-                    INPROC_HOOK_ACTIVE.store(true, Ordering::SeqCst);
-                    log::info!(
-                        "IN-PROCESS WH_GETMESSAGE hook installed on Chrome thread {} hook={:?}",
-                        chrome_tid, h
-                    );
-                    // Diagnostic: monitor suppress count
-                    std::thread::spawn(move || {
-                        for i in 0..6 {
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                            log::info!(
-                                "[DIAG] in-process hook after {}s: suppress={} heartbeat={}",
-                                (i + 1) * 3,
-                                INPROC_SUPPRESS_COUNT.load(Ordering::Relaxed),
-                                INPROC_HEARTBEAT.load(Ordering::Relaxed),
-                            );
-                        }
-                    });
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("In-process hook failed: {} — falling back to DLL injection", e);
-                }
-            }
-        }
-
-        // === Strategy 2: Cross-process hook via DLL injection ===
-        // Chrome_RenderWidgetHostHWND is in msedgewebview2.exe.
-        // SetWindowsHookExW requires a DLL module for cross-process hooks.
-        // NOTE: WebView2's Code Integrity Guard (CIG) may block unsigned DLL injection.
-        // The --disable-features=RendererCodeIntegrity browser arg is set in tauri.conf.json
-        // to attempt to bypass this.
-        log::info!("Using cross-process DLL hook (Chrome HWND in pid {})", chrome_pid);
-
-        let dll_path = match std::env::current_exe() {
-            Ok(exe) => exe.parent().unwrap_or(std::path::Path::new(".")).join("mouseleave_hook.dll"),
-            Err(_) => {
-                log::warn!("Cannot determine exe path — hover suppression disabled");
-                return;
-            }
-        };
-
-        match std::fs::metadata(&dll_path) {
-            Ok(m) => log::info!("mouseleave_hook.dll found at {:?} ({} bytes)", dll_path, m.len()),
-            Err(_) => {
-                log::warn!("mouseleave_hook.dll not found at {:?} — hover suppression disabled", dll_path);
-                return;
-            }
-        }
-
-        let wide: Vec<u16> = dll_path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let hmod = match LoadLibraryW(PCWSTR(wide.as_ptr())) {
-            Ok(h) => h,
+    /// Send a mouse event via the composition controller's SendMouseInput.
+    /// Bypasses the Windows message queue entirely — no TrackMouseEvent, no WM_MOUSELEAVE race.
+    #[inline]
+    unsafe fn send_input(event_kind: i32, virtual_keys: i32, mouse_data: u32, x: i32, y: i32) -> bool {
+        let ptr = get_comp_controller_ptr();
+        if ptr == 0 { return false; }
+        match wry::send_mouse_input_raw(ptr, event_kind, virtual_keys, mouse_data, x, y) {
+            Ok(()) => true,
             Err(e) => {
-                log::warn!("Failed to load mouseleave_hook.dll: {} — hover suppression disabled", e);
-                return;
-            }
-        };
-
-        let proc_addr = match GetProcAddress(hmod, windows::core::s!("mouseleave_hook_proc")) {
-            Some(addr) => addr,
-            None => {
-                log::warn!("mouseleave_hook_proc not found in DLL — hover suppression disabled");
-                return;
-            }
-        };
-
-        let hook_proc: HOOKPROC = Some(std::mem::transmute(proc_addr));
-
-        match SetWindowsHookExW(WH_GETMESSAGE, hook_proc, hmod, chrome_tid) {
-            Ok(h) => {
-                log::info!(
-                    "CROSS-PROCESS WH_GETMESSAGE hook installed on Chrome thread {} via DLL hook={:?}",
-                    chrome_tid, h
-                );
-                // Diagnostic: monitor suppress count + heartbeat from the DLL
-                let cw_raw = cw.0 as isize;
-                std::thread::spawn(move || {
-                    for i in 0..6 {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        let cw = HWND(cw_raw as *mut core::ffi::c_void);
-                        let sc = GetPropW(cw, windows::core::w!("MWP_SC"));
-                        let hb = GetPropW(cw, windows::core::w!("MWP_HB"));
-                        log::info!(
-                            "[DIAG] DLL hook after {}s: suppress={} heartbeat={} (MWP_T={}, MWP_E={})",
-                            (i + 1) * 3,
-                            sc.0 as usize,
-                            hb.0 as usize,
-                            !GetPropW(cw, windows::core::w!("MWP_T")).0.is_null(),
-                            !GetPropW(cw, windows::core::w!("MWP_E")).0.is_null(),
-                        );
-                    }
-                });
-            }
-            Err(e) => log::warn!(
-                "Failed to install WH_GETMESSAGE hook on Chrome thread {}: {}",
-                chrome_tid, e
-            ),
-        }
-    }
-
-    /// Spawns a background thread that polls for Chrome_RenderWidgetHostHWND.
-    /// Chrome creates this HWND after the first navigation, so we retry for up to 3 seconds.
-    pub fn start_chrome_widget_discovery(webview_hwnd: HWND) {
-        let wv_raw = webview_hwnd.0 as isize;
-        std::thread::spawn(move || {
-            let wv = HWND(wv_raw as *mut core::ffi::c_void);
-            for _ in 0..60 { // 60 × 50ms = 3 seconds
-                if let Some(cw) = discover_chrome_widget(wv) {
-                    set_chrome_widget_hwnd(cw.0 as isize);
-                    log::info!("Chrome_RenderWidgetHostHWND discovered: 0x{:X}", cw.0 as isize);
-                    unsafe { install_chrome_msg_hook(cw); }
-                    return;
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    log::warn!("SendMouseInput failed: {}", e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                false
             }
-            log::warn!("Chrome_RenderWidgetHostHWND not found after 3s — PostMessage forwarding disabled until re-discovery.");
-        });
+        }
     }
 
     /// Vérifie que tous les HWNDs desktop sont encore valides (détecte un redémarrage d'Explorer)
@@ -702,20 +531,10 @@ pub mod mouse_hook {
 
                         // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
                         if state == STATE_IDLE && !is_over_desktop {
-                            // Transition desktop → hors-desktop : envoyer WM_MOUSELEAVE to reset CSS :hover
+                            // Transition desktop → off-desktop: send MOUSE_LEAVE to reset CSS :hover
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
-                                let cw_raw = get_chrome_widget_hwnd();
-                                if cw_raw != 0 {
-                                    let cw = HWND(cw_raw as *mut core::ffi::c_void);
-                                    // Signal our hook to let this intentional WM_MOUSELEAVE through
-                                    if INPROC_HOOK_ACTIVE.load(Ordering::Relaxed) {
-                                        EXPLICIT_LEAVE.store(true, Ordering::Relaxed);
-                                    } else {
-                                        let _ = SetPropW(cw, windows::core::w!("MWP_E"), HANDLE(1 as *mut _));
-                                    }
-                                    let _ = PostMessageW(cw, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
-                                    log::info!("[HOOK] cursor left desktop → sent explicit WM_MOUSELEAVE");
-                                }
+                                send_input(MOUSE_LEAVE, VK_NONE, 0, pt.x, pt.y);
+                                log::info!("[HOOK] cursor left desktop → sent SendMouseInput LEAVE");
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
@@ -748,89 +567,62 @@ pub mod mouse_hook {
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // 2. POSTMESSAGE TO CHROME — Forward Win32 messages to Chromium's
-                        //    internal input HWND. This goes through Chromium's native input
-                        //    pipeline: CSS :hover, scroll, click, drag, focus all work natively.
-                        //    No JS adaptation needed (approach used by Lively Wallpaper).
-                        let cw_raw = get_chrome_widget_hwnd();
+                        // 2. SEND MOUSE INPUT — Forward events via CompositionController.
+                        //    SendMouseInput bypasses TrackMouseEvent entirely — CSS :hover,
+                        //    scroll, click, drag, focus all work natively. No JS adaptation needed.
 
-                        // Lazy re-discovery: if Chrome widget not found yet, try once
-                        // (EnumChildWindows with 2-3 children takes <1ms, safe in hook)
-                        let cw_raw = if cw_raw == 0 {
-                            if let Some(found) = discover_chrome_widget(wv) {
-                                set_chrome_widget_hwnd(found.0 as isize);
-                                log::info!("Chrome_RenderWidgetHostHWND lazy-discovered: 0x{:X}", found.0 as isize);
-                                found.0 as isize
-                            } else {
-                                0
+                        // Convert screen coords → client coords for WebView.
+                        // SendMouseInput expects coordinates relative to the WebView's top-left.
+                        use windows::Win32::Graphics::Gdi::ScreenToClient;
+                        let mut client_pt = pt;
+                        let _ = ScreenToClient(wv, &mut client_pt);
+
+                        static INPUT_COUNT: AtomicU32 = AtomicU32::new(0);
+                        let n = INPUT_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                        match msg {
+                            WM_MOUSEMOVE => {
+                                let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
+                                send_input(MOUSE_MOVE, vk, 0, client_pt.x, client_pt.y);
+                                if n < 3 || n % 200 == 0 {
+                                    log::info!("[INPUT] #{} MOVE screen=({},{}) client=({},{}) vk={} state={}",
+                                        n, pt.x, pt.y, client_pt.x, client_pt.y, vk, state);
+                                }
                             }
-                        } else {
-                            cw_raw
-                        };
-
-                        if cw_raw != 0 {
-                            let cw = HWND(cw_raw as *mut core::ffi::c_void);
-
-                            // Convert screen coords → client coords for Chrome_RenderWidgetHostHWND.
-                            // WM_MOUSEMOVE/LBUTTON*/etc. expect client-relative coordinates.
-                            // WM_MOUSEWHEEL is the exception — it uses screen coords.
-                            use windows::Win32::Graphics::Gdi::ScreenToClient;
-                            let mut client_pt = pt;
-                            let stc_ok = ScreenToClient(cw, &mut client_pt);
-                            let lparam_client = LPARAM(((client_pt.y as u16 as u32) << 16 | (client_pt.x as u16 as u32)) as isize);
-                            let lparam_screen = LPARAM(((pt.y as u16 as u32) << 16 | (pt.x as u16 as u32)) as isize);
-
-                            // Sampled move log (every 200), all other events logged
-                            static POST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                            let n = POST_COUNT.fetch_add(1, Ordering::Relaxed);
-
-                            match msg {
-                                WM_MOUSEMOVE => {
-                                    let mk = DRAG_BUTTON_MK.load(Ordering::Relaxed) as usize;
-                                    let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_client);
-                                    if n < 3 || n % 200 == 0 {
-                                        log::info!("[POST] #{} WM_MOUSEMOVE screen=({},{}) client=({},{}) stc={} mk={} state={}",
-                                            n, pt.x, pt.y, client_pt.x, client_pt.y, stc_ok.as_bool(), mk, state);
-                                    }
-                                }
-                                WM_LBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_LBUTTON as u16, Ordering::Relaxed);
-                                    let r = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lparam_client);
-                                    log::info!("[POST] WM_LBUTTONDOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
-                                }
-                                WM_LBUTTONUP => {
-                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let r = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_client);
-                                    log::info!("[POST] WM_LBUTTONUP screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
-                                }
-                                WM_RBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_RBUTTON as u16, Ordering::Relaxed);
-                                    let r = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON), lparam_client);
-                                    log::info!("[POST] WM_RBUTTONDOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, r.is_ok());
-                                }
-                                WM_RBUTTONUP => {
-                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_RBUTTONUP, WPARAM(0), lparam_client);
-                                }
-                                WM_MBUTTONDOWN => {
-                                    DRAG_BUTTON_MK.store(MK_MBUTTON as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON), lparam_client);
-                                }
-                                WM_MBUTTONUP => {
-                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_MBUTTONUP, WPARAM(0), lparam_client);
-                                }
-                                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                    let delta = info.mouseData & 0xFFFF0000;
-                                    let delta_val = (info.mouseData >> 16) as i16;
-                                    let r = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_screen);
-                                    log::info!("[POST] WM_MOUSEWHEEL delta={} screen=({},{}) ok={} horiz={}",
-                                        delta_val, pt.x, pt.y, r.is_ok(), msg == WM_MOUSEHWHEEL);
-                                }
-                                _ => {}
+                            WM_LBUTTONDOWN => {
+                                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
+                                let ok = send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
+                                log::info!("[INPUT] LBUTTON_DOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, ok);
                             }
-                        } else if msg != WM_MOUSEMOVE {
-                            log::warn!("[HOOK] Chrome widget HWND=0 — cannot forward msg=0x{:X}", msg);
+                            WM_LBUTTONUP => {
+                                DRAG_VK.store(0, Ordering::Relaxed);
+                                let ok = send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                                log::info!("[INPUT] LBUTTON_UP screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, ok);
+                            }
+                            WM_RBUTTONDOWN => {
+                                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
+                                send_input(MOUSE_RBUTTON_DOWN, VK_RBUTTON, 0, client_pt.x, client_pt.y);
+                            }
+                            WM_RBUTTONUP => {
+                                DRAG_VK.store(0, Ordering::Relaxed);
+                                send_input(MOUSE_RBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                            }
+                            WM_MBUTTONDOWN => {
+                                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
+                                send_input(MOUSE_MBUTTON_DOWN, VK_MBUTTON, 0, client_pt.x, client_pt.y);
+                            }
+                            WM_MBUTTONUP => {
+                                DRAG_VK.store(0, Ordering::Relaxed);
+                                send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+                            }
+                            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                                let delta = info.mouseData & 0xFFFF0000;
+                                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
+                                let ok = send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
+                                log::info!("[INPUT] WHEEL delta={} screen=({},{}) ok={} horiz={}",
+                                    (info.mouseData >> 16) as i16, pt.x, pt.y, ok, msg == WM_MOUSEHWHEEL);
+                            }
+                            _ => {}
                         }
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }

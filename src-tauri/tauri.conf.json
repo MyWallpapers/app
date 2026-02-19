@@ -28,9 +28,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "mouseleave_hook.dll"
-    ],
+    "resources": [],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
@@ -68,7 +66,7 @@
         "focus": false,
         "visible": false,
         "devtools": true,
-        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion,RendererCodeIntegrity --disable-backgrounding-occluded-windows"
+        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows"
       }
     ],
     "trayIcon": {

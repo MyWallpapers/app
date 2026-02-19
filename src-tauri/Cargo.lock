@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.101"
+version = "1.0.108"
 dependencies = [
  "log",
  "objc",
@@ -2323,7 +2323,9 @@ dependencies = [
  "tauri-plugin-updater",
  "typeshare",
  "url",
+ "webview2-com",
  "windows 0.58.0",
+ "wry",
 ]
 
 [[package]]
@@ -5945,8 +5947,6 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "wry"
 version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728b7d4c8ec8d81cab295e0b5b8a4c263c0d41a785fb8f8c4df284e5411140a2"
 dependencies = [
  "base64 0.22.1",
  "block2",
