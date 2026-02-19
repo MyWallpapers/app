@@ -209,40 +209,80 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
     }
 }
 
-/// Injecte notre WebView dans la hiérarchie desktop avec le bon Z-order
+/// Injecte notre WebView dans la hiérarchie desktop avec le bon Z-order.
+///
+/// Comprehensive style mutation per Win32/DWM architecture:
+/// 1. Strip ALL decoration/resize styles (WS_THICKFRAME, WS_CAPTION, WS_SYSMENU, etc.)
+/// 2. Strip ALL extended border styles (CLIENTEDGE, WINDOWEDGE, DLGMODALFRAME, STATICEDGE)
+/// 3. Add WS_CHILD (required for SetParent into Progman/WorkerW)
+/// 4. Add WS_EX_TOOLWINDOW (hide from taskbar + alt-tab)
+/// 5. Add WS_EX_LAYERED + SetLayeredWindowAttributes(alpha=255) for 24H2 DWM composition
+/// 6. Disable DWM rounded corners (DWMWCP_DONOTROUND) and border color
+/// 7. SWP_FRAMECHANGED forces WM_NCCALCSIZE recalculation → non-client area collapses to 0px
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::Graphics::Dwm::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     unsafe {
-        // Si déjà injecté dans le bon parent, ne rien faire
+        // Skip if already injected into the correct parent
         if GetParent(our_hwnd) == Ok(detection.target_parent) {
             return;
         }
 
-        // 1. Strip ALL border styles — classic and extended
-        let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
-        style &= !(WS_POPUP.0 as i32);
-        style &= !(WS_THICKFRAME.0 as i32);
-        style &= !(WS_CAPTION.0 as i32);
-        style &= !(WS_BORDER.0 as i32);
-        style |= WS_CHILD.0 as i32;
-        let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
+        // ── GWL_STYLE: eradicate all decoration/resize bits ──
+        let mut style = GetWindowLongW(our_hwnd, GWL_STYLE) as u32;
+        style &= !(WS_THICKFRAME.0   // invisible resize borders (7-8px phantom margins)
+                  | WS_CAPTION.0      // title bar (includes WS_BORDER | WS_DLGFRAME)
+                  | WS_SYSMENU.0      // system menu
+                  | WS_MAXIMIZEBOX.0  // maximize button
+                  | WS_MINIMIZEBOX.0  // minimize button
+                  | WS_POPUP.0);      // conflicts with WS_CHILD
+        style |= WS_CHILD.0 | WS_VISIBLE.0;
+        let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
-        // 2. Strip extended border styles (invisible shadows from Windows DWM)
-        let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE);
-        ex_style &= !(WS_EX_CLIENTEDGE.0 as i32);
-        ex_style &= !(WS_EX_WINDOWEDGE.0 as i32);
-        ex_style &= !(WS_EX_DLGMODALFRAME.0 as i32);
-        let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style);
+        // ── GWL_EXSTYLE: strip border artifacts, add layered + toolwindow ──
+        let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
+        ex_style &= !(WS_EX_CLIENTEDGE.0     // 3D sunken border
+                     | WS_EX_WINDOWEDGE.0     // raised edge border
+                     | WS_EX_DLGMODALFRAME.0  // double border
+                     | WS_EX_STATICEDGE.0);   // static edge border
+        ex_style |= WS_EX_TOOLWINDOW.0   // hide from taskbar + alt-tab
+                  | WS_EX_LAYERED.0;      // mandatory for 24H2 DWM composition under Progman
+        let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
+        // ── WS_EX_LAYERED: set fully opaque (alpha=255) ──
+        // Tells DWM to skip per-pixel alpha computation → optimal blt present performance.
+        let _ = SetLayeredWindowAttributes(our_hwnd, COLORREF(0), 255, LWA_ALPHA);
+
+        // ── DWM: disable rounded corners (Win11 22000+) ──
+        let corner_pref: u32 = 1; // DWMWCP_DONOTROUND
+        let _ = DwmSetWindowAttribute(
+            our_hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_pref as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        // ── DWM: remove accent border color ──
+        let border_color: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            our_hwnd,
+            DWMWA_BORDER_COLOR,
+            &border_color as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        // ── Reparent into desktop hierarchy ──
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // 3. Z-order placement (SWP_NOMOVE|SWP_NOSIZE — geometry untouched)
+        // ── Z-order placement ──
         if detection.is_24h2 {
+            // Insert behind SHELLDLL_DefView (icons render above us)
             let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+            // Push OS WorkerW behind us (wallpaper transition layer)
             let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
         } else {
@@ -250,7 +290,9 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
 
-        // 4. Position + size using GetClientRect (pure display area, no border overflow)
+        // ── Size: GetClientRect of parent (pure display area, no DWM overhead) ──
+        // SWP_FRAMECHANGED forces WM_NCCALCSIZE recalculation.
+        // With WS_THICKFRAME gone, non-client area = 0px → Window Rect == Client Rect.
         let mut parent_rect = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(detection.target_parent, &mut parent_rect);
         let _ = SetWindowPos(our_hwnd, HWND::default(),
