@@ -427,9 +427,12 @@ pub mod mouse_hook {
             }
         };
 
-        if !dll_path.exists() {
-            log::warn!("mouseleave_hook.dll not found at {:?} — hover suppression disabled", dll_path);
-            return;
+        match std::fs::metadata(&dll_path) {
+            Ok(m) => log::info!("mouseleave_hook.dll found at {:?} ({} bytes)", dll_path, m.len()),
+            Err(_) => {
+                log::warn!("mouseleave_hook.dll not found at {:?} — hover suppression disabled", dll_path);
+                return;
+            }
         }
 
         // Load the DLL into our process (Windows uses the path to load it into WebView2 too)

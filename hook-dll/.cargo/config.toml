@@ -1,0 +1,8 @@
+# Force static CRT linking for the hook DLL.
+# Without this, Rust cdylib defaults to dynamic CRT, making the DLL
+# depend on VCRUNTIME140.dll — which may not be installed on the target system.
+# The main exe uses static CRT by default (bin crate type), so it runs fine,
+# but the DLL fails to load with ERROR_MOD_NOT_FOUND (0x8007007E).
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
