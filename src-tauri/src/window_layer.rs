@@ -389,7 +389,6 @@ pub mod mouse_hook {
     // The hook runs on a separate thread, so we PostMessage to a hidden window on the UI thread.
     const WM_MWP_MOUSE: u32 = 0x8000 + 42; // WM_APP + 42
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
-    static PENDING_WHEEL_DATA: AtomicU32 = AtomicU32::new(0);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -411,15 +410,16 @@ pub mod mouse_hook {
 
     /// Queue a mouse event for dispatch on the UI thread via PostMessage.
     /// SendMouseInput is STA-bound and must be called from the UI thread.
+    /// Layout: wparam = [mouse_data:32 | vkeys:16 | event:16], lparam = [y:16 | x:16]
     #[inline]
     unsafe fn send_input(event_kind: i32, virtual_keys: i32, mouse_data: u32, x: i32, y: i32) -> bool {
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
         if dh == 0 { return false; }
-        // For wheel events, stash the delta (consumed by dispatch proc)
-        if mouse_data != 0 {
-            PENDING_WHEEL_DATA.store(mouse_data, Ordering::Relaxed);
-        }
-        let wparam = WPARAM((event_kind as u16 as usize) | ((virtual_keys as u16 as usize) << 16));
+        let wparam = WPARAM(
+            (event_kind as u16 as usize)
+            | ((virtual_keys as u16 as usize) << 16)
+            | ((mouse_data as usize) << 32)
+        );
         let lparam = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
         PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wparam, lparam).is_ok()
     }
@@ -432,13 +432,20 @@ pub mod mouse_hook {
         if msg == WM_MWP_MOUSE {
             let event_kind = (wparam.0 & 0xFFFF) as i32;
             let virtual_keys = ((wparam.0 >> 16) & 0xFFFF) as i32;
+            let mouse_data = ((wparam.0 >> 32) & 0xFFFFFFFF) as u32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let mouse_data = if event_kind == MOUSE_WHEEL || event_kind == MOUSE_HWHEEL {
-                PENDING_WHEEL_DATA.load(Ordering::Relaxed)
-            } else {
-                0
-            };
+
+            // Coalesce consecutive MOUSE_MOVE: if a newer MOVE is already queued, skip this one.
+            // This prevents stale position updates from piling up when the UI thread is behind.
+            if event_kind == MOUSE_MOVE {
+                let mut peek = MSG::default();
+                if PeekMessageW(&mut peek, hwnd, WM_MWP_MOUSE, WM_MWP_MOUSE, PM_NOREMOVE).into() {
+                    if (peek.wParam.0 & 0xFFFF) as i32 == MOUSE_MOVE {
+                        return LRESULT(0);
+                    }
+                }
+            }
 
             let ptr = get_comp_controller_ptr();
             if ptr != 0 {
@@ -557,40 +564,27 @@ pub mod mouse_hook {
                             || IsChild(wv, hwnd_under).as_bool()
                             || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
 
-                        // Détection d'overlay système (Win11 Widgets/Copilot/Search)
-                        // Ces fenêtres sont transparentes visuellement mais bloquent WindowFromPoint.
+                        // Fast path for non-desktop windows:
+                        // If cursor is on or inside the foreground window → real app, skip overlay check.
+                        // Only do expensive overlay detection for non-foreground transparent windows
+                        // (Win11 Widgets/Copilot/Search that steal WindowFromPoint).
                         if !is_over_desktop {
-                            let root = GetAncestor(hwnd_under, GA_ROOT);
                             let fg = GetForegroundWindow();
-
-                            // Si la fenêtre est au premier plan → c'est une vraie app, pas d'override
-                            // Sinon, vérifier les styles d'overlay + PID non-Explorer
-                            if root != fg && hwnd_under != fg && !root.is_invalid() {
-                                let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
-                                let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
-                                    || (ex & WS_EX_TOOLWINDOW.0) != 0
-                                    || ((ex & WS_EX_LAYERED.0) != 0 && (ex & WS_EX_APPWINDOW.0) == 0);
-
-                                if is_overlay_style {
-                                    let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
-                                    let mut overlay_pid = 0u32;
-                                    GetWindowThreadProcessId(root, Some(&mut overlay_pid));
-                                    if overlay_pid != explorer_pid && overlay_pid != 0 {
-                                        is_over_desktop = true;
+                            if hwnd_under != fg {
+                                let root = GetAncestor(hwnd_under, GA_ROOT);
+                                if root != fg && !root.is_invalid() {
+                                    let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                                    let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
+                                        || (ex & WS_EX_TOOLWINDOW.0) != 0
+                                        || ((ex & WS_EX_LAYERED.0) != 0 && (ex & WS_EX_APPWINDOW.0) == 0);
+                                    if is_overlay_style {
+                                        let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
+                                        let mut overlay_pid = 0u32;
+                                        GetWindowThreadProcessId(root, Some(&mut overlay_pid));
+                                        if overlay_pid != explorer_pid && overlay_pid != 0 {
+                                            is_over_desktop = true;
+                                        }
                                     }
-                                }
-                            }
-                        }
-
-                        // Fallback: walk parent chain — IsChild() may fail after SetParent injection
-                        if !is_over_desktop {
-                            let mut walk = hwnd_under;
-                            for _ in 0..5 {
-                                walk = GetAncestor(walk, GA_PARENT);
-                                if walk.is_invalid() || walk == tp { break; }
-                                if walk == wv {
-                                    is_over_desktop = true;
-                                    break;
                                 }
                             }
                         }
@@ -602,7 +596,6 @@ pub mod mouse_hook {
                             // Transition desktop → off-desktop: send MOUSE_LEAVE to reset CSS :hover
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, pt.x, pt.y);
-                                log::info!("[HOOK] cursor left desktop → sent SendMouseInput LEAVE");
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
@@ -619,10 +612,8 @@ pub mod mouse_hook {
                         if is_down && state == STATE_IDLE {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 state = STATE_NATIVE;
-                                log::info!("[HOOK] state IDLE→NATIVE (click on icon) pt=({},{})", pt.x, pt.y);
                             } else {
                                 state = STATE_WEB;
-                                log::info!("[HOOK] state IDLE→WEB (click on desktop) pt=({},{})", pt.x, pt.y);
                             }
                             HOOK_STATE.store(state, Ordering::SeqCst);
                         }
@@ -630,7 +621,6 @@ pub mod mouse_hook {
                         if state == STATE_NATIVE {
                             if is_up {
                                 HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst);
-                                log::info!("[HOOK] state NATIVE→IDLE (mouseup)");
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
@@ -645,27 +635,18 @@ pub mod mouse_hook {
                         let mut client_pt = pt;
                         let _ = ScreenToClient(wv, &mut client_pt);
 
-                        static INPUT_COUNT: AtomicU32 = AtomicU32::new(0);
-                        let n = INPUT_COUNT.fetch_add(1, Ordering::Relaxed);
-
                         match msg {
                             WM_MOUSEMOVE => {
                                 let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
                                 send_input(MOUSE_MOVE, vk, 0, client_pt.x, client_pt.y);
-                                if n < 3 || n % 200 == 0 {
-                                    log::info!("[INPUT] #{} MOVE screen=({},{}) client=({},{}) vk={} state={}",
-                                        n, pt.x, pt.y, client_pt.x, client_pt.y, vk, state);
-                                }
                             }
                             WM_LBUTTONDOWN => {
                                 DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
-                                let ok = send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
-                                log::info!("[INPUT] LBUTTON_DOWN screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, ok);
+                                send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
                             }
                             WM_LBUTTONUP => {
                                 DRAG_VK.store(0, Ordering::Relaxed);
-                                let ok = send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
-                                log::info!("[INPUT] LBUTTON_UP screen=({},{}) client=({},{}) ok={}", pt.x, pt.y, client_pt.x, client_pt.y, ok);
+                                send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
                             }
                             WM_RBUTTONDOWN => {
                                 DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
@@ -684,13 +665,9 @@ pub mod mouse_hook {
                                 send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
                             }
                             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                // SendMouseInput expects GET_WHEEL_DELTA_WPARAM — the raw signed
-                                // delta value (120/-120), not the high-word-packed wParam.
                                 let delta = (info.mouseData >> 16) as i16 as i32 as u32;
                                 let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                                let ok = send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
-                                log::info!("[INPUT] WHEEL delta={} screen=({},{}) ok={} horiz={}",
-                                    delta as i32, pt.x, pt.y, ok, msg == WM_MOUSEHWHEEL);
+                                send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
                             }
                             _ => {}
                         }
