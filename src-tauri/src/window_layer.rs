@@ -221,7 +221,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 /// 7. SWP_FRAMECHANGED forces WM_NCCALCSIZE recalculation → non-client area collapses to 0px
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
-    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
     use windows::Win32::Graphics::Dwm::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -722,6 +722,7 @@ pub mod mouse_hook {
     /// DirectComposition rendering is unaffected (visual output continues).
     #[inline]
     unsafe fn disable_webview(wv: HWND) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
         if !WV_DISABLED.swap(true, Ordering::Relaxed) {
             let _ = EnableWindow(wv, false);
         }
@@ -730,6 +731,7 @@ pub mod mouse_hook {
     /// Re-enable the WebView HWND for normal interaction.
     #[inline]
     unsafe fn enable_webview(wv: HWND) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
         if WV_DISABLED.swap(false, Ordering::Relaxed) {
             let _ = EnableWindow(wv, true);
         }
