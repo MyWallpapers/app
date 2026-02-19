@@ -4,4 +4,3 @@ src-tauri/gen/schemas/
 *.log
 .DS_Store
 Thumbs.db
-src-tauri/mouseleave_hook.dll

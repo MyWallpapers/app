@@ -338,7 +338,7 @@ pub fn try_refresh_desktop() -> bool {
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
@@ -554,7 +554,7 @@ pub mod mouse_hook {
                             || hwnd_under == wv
                             || hwnd_under == sv    // SHELLDLL_DefView
                             || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
-                            || IsChild(wv, hwnd_under).as_bool()   // Chrome_RenderWidgetHostHWND etc.
+                            || IsChild(wv, hwnd_under).as_bool()
                             || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
 
                         // Détection d'overlay système (Win11 Widgets/Copilot/Search)

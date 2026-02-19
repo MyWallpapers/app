@@ -2307,20 +2307,6 @@ impl WebViewExtWindows for WebView {
   }
 }
 
-/// Returns the raw COM pointer for the composition controller.
-/// The caller must ensure the pointer remains valid (the WebView must stay alive).
-/// Returns 0 if the webview is not in composition mode.
-#[cfg(target_os = "windows")]
-pub fn get_composition_controller_raw(webview: &WebView) -> isize {
-  use WebViewExtWindows as _;
-  webview.composition_controller()
-    .map(|c| {
-      use windows::core::Interface;
-      c.as_raw() as isize
-    })
-    .unwrap_or(0)
-}
-
 /// Global atomic storing the last-created composition controller raw COM pointer.
 /// Set automatically during WebView2 creation when composition_mode is enabled.
 /// Allows the host app to retrieve the pointer without going through the WebView.
