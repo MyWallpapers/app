@@ -485,8 +485,13 @@ pub mod mouse_hook {
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
 
-                // Always forward to Wry — WebView2 can't receive clicks natively in desktop layer
-                forward(msg, &info_hook, cp.x, cp.y);
+                // Forward clicks via Wry (down/up events only).
+                // WM_MOUSEMOVE passes through to OS natively via CallNextHookEx below,
+                // which lets WebView2 handle hover via its own hit-testing.
+                // Forwarding moves via BOTH Wry AND OS causes double-delivery that breaks hover.
+                if msg != WM_MOUSEMOVE {
+                    forward(msg, &info_hook, cp.x, cp.y);
+                }
 
                 if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                 LRESULT(1)
