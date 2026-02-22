@@ -30,14 +30,14 @@ fn mw_init_script() -> String {
 pub use commands::*;
 
 pub fn main() {
-    // Clear previous log file so each run starts fresh
+    // Clear previous log files so each run starts fresh
     #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let log_dir = std::path::Path::new(&appdata).join("com.mywallpaper.desktop").join("logs");
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let log_dir = std::path::Path::new(&local_appdata).join("com.mywallpaper.desktop").join("logs");
         if let Ok(entries) = std::fs::read_dir(&log_dir) {
             for entry in entries.flatten() {
                 if entry.path().extension().is_some_and(|e| e == "log") {
-                    let _ = std::fs::write(entry.path(), b"");
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
