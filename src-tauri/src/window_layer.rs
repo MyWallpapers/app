@@ -437,6 +437,8 @@ pub mod mouse_hook {
     const STATE_NATIVE: u8 = 2;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
+    static DIAG_MISS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static DIAG_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
     static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -643,8 +645,9 @@ pub mod mouse_hook {
             debug!("[start_hook_thread] Hook thread spawned. Initializing COM...");
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED) {
-                    error!("[start_hook_thread] COM Initialization Failed: {}", e);
+                let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                if hr.is_err() {
+                    error!("[start_hook_thread] COM Initialization Failed. HRESULT: {:?}", hr);
                 } else {
                     debug!("[start_hook_thread] COM Initialized (COINIT_APARTMENTTHREADED).");
                 }
@@ -697,6 +700,21 @@ pub mod mouse_hook {
                 // STATE_IDLE
                 let hwnd_under = WindowFromPoint(info.pt);
                 if !is_over_desktop(hwnd_under) {
+                    if !DIAG_MISS_LOGGED.load(Ordering::Relaxed) {
+                        let count = DIAG_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if count < 3 {
+                            let mut cls = [0u16; 64];
+                            let len = GetClassNameW(hwnd_under, &mut cls);
+                            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+                            log::debug!(
+                                "[diag] Mouse hook ignored: HWND=0x{:X} Class='{}'",
+                                hwnd_under.0 as isize,
+                                cls_name
+                            );
+                        } else {
+                            DIAG_MISS_LOGGED.store(true, Ordering::Relaxed);
+                        }
+                    }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
