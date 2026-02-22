@@ -68,6 +68,7 @@ pub fn restore_desktop_icons_and_unhook() {
 
 #[cfg(target_os = "windows")]
 struct DesktopDetection {
+    progman: windows::Win32::Foundation::HWND,
     target_parent: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
     v_x: i32,
@@ -159,6 +160,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         info!("[detect_desktop] Enforced Physical Screen Bounds: {}x{} at {},{}", width, height, m_rects.left, m_rects.top);
 
         Ok(DesktopDetection {
+            progman,
             target_parent,
             syslistview,
             v_x: m_rects.left,
@@ -238,6 +240,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
+    mouse_hook::set_progman_hwnd(detection.progman.0 as isize);
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
     }
@@ -295,6 +298,7 @@ pub mod mouse_hook {
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
+    static PROGMAN_HWND: AtomicIsize = AtomicIsize::new(0);
     static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -309,6 +313,7 @@ pub mod mouse_hook {
     pub fn set_webview_hwnd(h: isize) { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(h: isize) { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
     pub fn set_target_parent_hwnd(h: isize) { TARGET_PARENT_HWND.store(h, Ordering::SeqCst); }
+    pub fn set_progman_hwnd(h: isize) { PROGMAN_HWND.store(h, Ordering::SeqCst); }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
@@ -359,18 +364,18 @@ pub mod mouse_hook {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+        let pm = HWND(PROGMAN_HWND.load(Ordering::Relaxed) as *mut _);
 
         // Fast path: known HWNDs
         if !rwhh.is_invalid() && hwnd_under == rwhh { return true; }
-        if hwnd_under == tp || hwnd_under == wv { return true; }
+        if hwnd_under == tp || hwnd_under == wv || hwnd_under == pm { return true; }
 
-        // Child of our container or WebView
-        let is_child_tp = IsChild(tp, hwnd_under).as_bool();
-        let is_child_wv = !wv.is_invalid() && IsChild(wv, hwnd_under).as_bool();
-        if is_child_tp || is_child_wv { return true; }
+        // Progman contains SHELLDLL_DefView (on top in Z-order) + WorkerW (our container).
+        // WindowFromPoint returns SHELLDLL_DefView when cursor is on the desktop,
+        // because it sits ABOVE WorkerW. So we must recognize everything inside Progman.
+        if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() { return true; }
 
         // Auto-discover Chrome_RWHH — ONLY if it's a child of OUR WebView.
-        // Without IsChild check, we'd capture the user's Chrome browser RWHH!
         if rwhh.is_invalid() && !wv.is_invalid() {
             let mut cls = [0u16; 64];
             let len = GetClassNameW(hwnd_under, &mut cls) as usize;
