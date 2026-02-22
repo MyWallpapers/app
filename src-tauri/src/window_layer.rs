@@ -673,7 +673,7 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+                let info_hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
                 let msg = wparam.0 as u32;
                 let wv = HWND(wv_raw as *mut _);
                 let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
@@ -682,7 +682,7 @@ pub mod mouse_hook {
                 // ==========================================================
                 // SMART LOGGING : DÉTECTION DES CHANGEMENTS DE FENÊTRE
                 // ==========================================================
-                let hwnd_under = WindowFromPoint(info.pt);
+                let hwnd_under = WindowFromPoint(info_hook.pt);
                 let prev_hwnd = LAST_HWND_UNDER.swap(hwnd_under.0 as isize, Ordering::Relaxed);
 
                 if prev_hwnd != hwnd_under.0 as isize {
@@ -699,7 +699,7 @@ pub mod mouse_hook {
                 // ==========================================================
                 // SMART LOGGING : DÉTECTION DES SURVOLS D'ICÔNES DE BUREAU
                 // ==========================================================
-                let is_icon = is_mouse_over_desktop_icon(info.pt.x, info.pt.y);
+                let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
                 let prev_icon = LAST_ICON_STATE.swap(is_icon, Ordering::Relaxed);
 
                 if is_icon != prev_icon {
@@ -724,9 +724,9 @@ pub mod mouse_hook {
                 // STATE_DRAGGING (Holding a click on the WebView, forward everything)
                 if state == STATE_DRAGGING {
                     use windows::Win32::Graphics::Gdi::ScreenToClient;
-                    let mut cp = info.pt;
+                    let mut cp = info_hook.pt;
                     let _ = ScreenToClient(wv, &mut cp);
-                    forward(msg, &info, cp.x, cp.y);
+                    forward(msg, &info_hook, cp.x, cp.y);
                     if is_up {
                         info!("[hook_proc] [STATE] Mouse UP received. Transition: DRAGGING -> IDLE.");
                         HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
@@ -740,20 +740,20 @@ pub mod mouse_hook {
                 // Evaluate Desktop Icon Intersection on Clicks
                 if is_down {
                     if is_icon {
-                        info!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info.pt.x, info.pt.y);
+                        info!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info_hook.pt.x, info_hook.pt.y);
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
-                    info!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info.pt.x, info.pt.y);
+                    info!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info_hook.pt.x, info_hook.pt.y);
                     HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
                 // Forward Event Coordinates Translated to Client Area
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
-                let mut cp = info.pt;
+                let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
 
-                forward(msg, &info, cp.x, cp.y);
+                forward(msg, &info_hook, cp.x, cp.y);
 
                 if msg == WM_MOUSEMOVE {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
