@@ -459,17 +459,23 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
+                // In composition mode, WebView2 receives ALL input exclusively
+                // through SendMouseInput (Wry). Native OS message delivery does
+                // NOT work for composition-hosted WebView2. So we forward
+                // everything via Wry and swallow everything with LRESULT(1).
+                // The cursor still moves on screen (driver updates position
+                // BEFORE the hook runs).
+
                 if state == STATE_DRAGGING {
                     use windows::Win32::Graphics::Gdi::ScreenToClient;
                     let mut cp = info_hook.pt;
                     let _ = ScreenToClient(wv, &mut cp);
                     forward(msg, &info_hook, cp.x, cp.y);
                     if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                     return LRESULT(1);
                 }
 
-                // Check if icons are visible for native icon interaction
+                // IDLE state: decide whether to pass to OS (icon click) or Wry (webview)
                 let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
                 let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
 
@@ -484,16 +490,7 @@ pub mod mouse_hook {
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
-
-                // Forward clicks via Wry (down/up events only).
-                // WM_MOUSEMOVE passes through to OS natively via CallNextHookEx below,
-                // which lets WebView2 handle hover via its own hit-testing.
-                // Forwarding moves via BOTH Wry AND OS causes double-delivery that breaks hover.
-                if msg != WM_MOUSEMOVE {
-                    forward(msg, &info_hook, cp.x, cp.y);
-                }
-
-                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
+                forward(msg, &info_hook, cp.x, cp.y);
                 LRESULT(1)
             }
 
