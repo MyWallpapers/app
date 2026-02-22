@@ -77,6 +77,7 @@ pub fn restore_desktop_icons() {
 #[cfg(target_os = "windows")]
 struct DesktopDetection {
     target_parent: windows::Win32::Foundation::HWND,
+    shell_view: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
     v_x: i32,
     v_y: i32,
@@ -92,11 +93,11 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman. Explorer might be crashed.".to_string())?;
+            .map_err(|_| "Could not find Progman.".to_string())?;
 
         info!("[detect_desktop] Found Progman HWND: 0x{:X}", progman.0 as isize);
 
-        // Force Windows to create the special wallpaper WorkerW
+        // Force Windows to split the desktop and create the background WorkerW
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
@@ -105,14 +106,13 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         struct SearchData {
             shell_view: HWND,
-            shell_view_parent: HWND,
             workerw_sibling: HWND,
         }
 
+        // Wait up to 2 seconds for Windows to create the WorkerW
         for attempt in 1..=40 {
             let mut data = SearchData {
                 shell_view: HWND::default(),
-                shell_view_parent: HWND::default(),
                 workerw_sibling: HWND::default(),
             };
 
@@ -121,7 +121,6 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
                 if !sv.is_invalid() {
                     let d = &mut *(lp.0 as *mut SearchData);
                     d.shell_view = sv;
-                    d.shell_view_parent = hwnd;
                     d.workerw_sibling = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
                     return BOOL(0);
                 }
@@ -133,24 +132,25 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             if !data.shell_view.is_invalid() {
                 shell_view = data.shell_view;
 
+                // Only break when WorkerW sibling is actually found
                 if !data.workerw_sibling.is_invalid() {
                     target_parent = data.workerw_sibling;
-                    info!("[detect_desktop] Sibling WorkerW found (0x{:X}) on attempt {}. Standard architecture.",
-                        target_parent.0 as isize, attempt);
-                    break;
-                } else if !data.shell_view_parent.is_invalid() {
-                    // Fallback: no sibling WorkerW — inject into SHELLDLL_DefView's parent directly
-                    target_parent = data.shell_view_parent;
-                    info!("[detect_desktop] Sibling WorkerW missing. Falling back to SHELLDLL_DefView parent (0x{:X}) on attempt {}.",
-                        target_parent.0 as isize, attempt);
+                    info!("[detect_desktop] Sibling WorkerW found (0x{:X}) on attempt {}", target_parent.0 as isize, attempt);
                     break;
                 }
             }
+            // WorkerW not ready yet — wait and retry
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
+        // Fallback only after exhausting all 40 attempts
         if target_parent.is_invalid() {
-            return Err("Desktop detection failed. Could not locate SHELLDLL_DefView hierarchy.".to_string());
+            if !shell_view.is_invalid() {
+                target_parent = GetParent(shell_view).unwrap_or(progman);
+                info!("[detect_desktop] Sibling WorkerW definitely missing. Falling back to parent (0x{:X}).", target_parent.0 as isize);
+            } else {
+                return Err("Desktop detection failed. Could not locate SHELLDLL_DefView.".to_string());
+            }
         }
 
         // Find SysListView32 (desktop icons) for hide/show support
@@ -192,6 +192,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         Ok(DesktopDetection {
             target_parent,
+            shell_view,
             syslistview,
             v_x: m_rects.left,
             v_y: m_rects.top,
@@ -207,7 +208,6 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     unsafe {
@@ -228,9 +228,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // HWND_BOTTOM placement ensures we're behind desktop icons
+        // Place just behind shell_view (icons layer) instead of HWND_BOTTOM
+        // to avoid being hidden behind XAML wallpaper layer on 24H2
         let _ = SetWindowPos(
-            our_hwnd, HWND_BOTTOM,
+            our_hwnd, detection.shell_view,
             detection.v_x, detection.v_y, detection.v_width, detection.v_height,
             SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         );
