@@ -116,12 +116,13 @@ fn start_with_tauri_webview() {
             if let Some(window) = app.get_webview_window("main") {
                 use tauri::webview::Color;
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 255)));
-                let _ = window.set_decorations(false);
-                let _ = window.show();
-                debug!("[setup] Main window shown. Firing Desktop Subsystem Injection...");
 
-                // Fire Desktop Subsystem
+                // Inject into desktop BEFORE showing to prevent visible flash
+                debug!("[setup] Firing Desktop Subsystem Injection...");
                 window_layer::setup_desktop_window(&window);
+
+                let _ = window.show();
+                debug!("[setup] Main window shown (post-injection).");
             } else {
                 error!("[setup] CRITICAL: Main webview window not found during setup phase.");
             }
