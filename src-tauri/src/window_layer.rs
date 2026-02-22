@@ -69,6 +69,7 @@ pub fn restore_desktop_icons_and_unhook() {
 #[cfg(target_os = "windows")]
 struct DesktopDetection {
     progman: windows::Win32::Foundation::HWND,
+    explorer_pid: u32,
     target_parent: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
     v_x: i32,
@@ -86,6 +87,10 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman.".to_string())?;
+
+        let mut explorer_pid: u32 = 0;
+        GetWindowThreadProcessId(progman, Some(&mut explorer_pid));
+        info!("[detect_desktop] Progman 0x{:X} belongs to explorer.exe pid={}", progman.0 as isize, explorer_pid);
 
         // Force Windows to spawn the wallpaper WorkerW layer
         let mut msg_result: usize = 0;
@@ -161,6 +166,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         Ok(DesktopDetection {
             progman,
+            explorer_pid,
             target_parent,
             syslistview,
             v_x: m_rects.left,
@@ -241,6 +247,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
     mouse_hook::set_progman_hwnd(detection.progman.0 as isize);
+    mouse_hook::set_explorer_pid(detection.explorer_pid);
+    info!("[ensure_in_worker_w] Progman=0x{:X}, explorer_pid={}", detection.progman.0 as isize, detection.explorer_pid);
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
     }
@@ -286,7 +294,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use log::{error, info};
-    use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -299,6 +307,8 @@ pub mod mouse_hook {
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static PROGMAN_HWND: AtomicIsize = AtomicIsize::new(0);
+    static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
+    static DESKTOP_CORE_HWND: AtomicIsize = AtomicIsize::new(0);
     static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -314,6 +324,7 @@ pub mod mouse_hook {
     pub fn set_syslistview_hwnd(h: isize) { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
     pub fn set_target_parent_hwnd(h: isize) { TARGET_PARENT_HWND.store(h, Ordering::SeqCst); }
     pub fn set_progman_hwnd(h: isize) { PROGMAN_HWND.store(h, Ordering::SeqCst); }
+    pub fn set_explorer_pid(pid: u32) { EXPLORER_PID.store(pid, Ordering::SeqCst); }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
@@ -365,22 +376,39 @@ pub mod mouse_hook {
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
         let pm = HWND(PROGMAN_HWND.load(Ordering::Relaxed) as *mut _);
+        let dc = HWND(DESKTOP_CORE_HWND.load(Ordering::Relaxed) as *mut _);
 
-        // Fast path: known HWNDs
+        // Fast path: known HWNDs (includes cached desktop CoreWindow)
         if !rwhh.is_invalid() && hwnd_under == rwhh { return true; }
+        if !dc.is_invalid() && hwnd_under == dc { return true; }
         if hwnd_under == tp || hwnd_under == wv || hwnd_under == pm { return true; }
 
         // Progman contains SHELLDLL_DefView (on top in Z-order) + WorkerW (our container).
-        // WindowFromPoint returns SHELLDLL_DefView when cursor is on the desktop,
-        // because it sits ABOVE WorkerW. So we must recognize everything inside Progman.
         if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() { return true; }
+
+        // Slow path: class name check for unknown windows
+        let mut cls = [0u16; 64];
+        let len = GetClassNameW(hwnd_under, &mut cls) as usize;
+        let cls_name = String::from_utf16_lossy(&cls[..len]);
+
+        // Win11 24H2: desktop background is a Windows.UI.Core.CoreWindow owned by explorer.exe.
+        // It sits ON TOP of Progman/WorkerW in Z-order and intercepts WindowFromPoint.
+        if cls_name == "Windows.UI.Core.CoreWindow" {
+            let exp_pid = EXPLORER_PID.load(Ordering::Relaxed);
+            if exp_pid != 0 {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
+                if pid == exp_pid {
+                    info!("[is_over_desktop] Desktop CoreWindow detected: 0x{:X} (explorer.exe pid={})",
+                        hwnd_under.0 as isize, pid);
+                    DESKTOP_CORE_HWND.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
 
         // Auto-discover Chrome_RWHH — ONLY if it's a child of OUR WebView.
         if rwhh.is_invalid() && !wv.is_invalid() {
-            let mut cls = [0u16; 64];
-            let len = GetClassNameW(hwnd_under, &mut cls) as usize;
-            let cls_name = String::from_utf16_lossy(&cls[..len]);
-
             if cls_name == "Chrome_RenderWidgetHostHWND" && IsChild(wv, hwnd_under).as_bool() {
                 CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
                 info!("[is_over_desktop] OUR Chrome_RWHH confirmed at 0x{:X} (child of wv 0x{:X})",
