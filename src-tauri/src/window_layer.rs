@@ -71,7 +71,7 @@ pub fn restore_desktop_icons() {
 }
 
 // ============================================================================
-// Windows: Desktop Detection (Universal WorkerW Standard Method)
+// Windows: Desktop Detection (Ultra-Robust + Fallback)
 // ============================================================================
 
 #[cfg(target_os = "windows")]
@@ -92,37 +92,65 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman.".to_string())?;
+            .map_err(|_| "Could not find Progman. Explorer might be crashed.".to_string())?;
 
         info!("[detect_desktop] Found Progman HWND: 0x{:X}", progman.0 as isize);
 
-        // Force Windows to split the desktop and create the background WorkerW
+        // Force Windows to create the special wallpaper WorkerW
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
-        // Universal method: EnumWindows to find the WorkerW sibling of SHELLDLL_DefView's parent
         let mut target_parent = HWND::default();
+        let mut shell_view = HWND::default();
 
-        unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-            let sv = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-            if !sv.is_invalid() {
-                let target = &mut *(lp.0 as *mut HWND);
-                *target = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
-            }
-            BOOL(1)
+        struct SearchData {
+            shell_view: HWND,
+            shell_view_parent: HWND,
+            workerw_sibling: HWND,
         }
 
         for attempt in 1..=40 {
-            let _ = EnumWindows(Some(enum_windows_cb), LPARAM(&mut target_parent as *mut _ as isize));
-            if !target_parent.is_invalid() {
-                info!("[detect_desktop] Found WorkerW target on attempt {}: 0x{:X}", attempt, target_parent.0 as isize);
-                break;
+            let mut data = SearchData {
+                shell_view: HWND::default(),
+                shell_view_parent: HWND::default(),
+                workerw_sibling: HWND::default(),
+            };
+
+            unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+                let sv = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+                if !sv.is_invalid() {
+                    let d = &mut *(lp.0 as *mut SearchData);
+                    d.shell_view = sv;
+                    d.shell_view_parent = hwnd;
+                    d.workerw_sibling = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
+                    return BOOL(0);
+                }
+                BOOL(1)
+            }
+
+            let _ = EnumWindows(Some(enum_cb), LPARAM(&mut data as *mut _ as isize));
+
+            if !data.shell_view.is_invalid() {
+                shell_view = data.shell_view;
+
+                if !data.workerw_sibling.is_invalid() {
+                    target_parent = data.workerw_sibling;
+                    info!("[detect_desktop] Sibling WorkerW found (0x{:X}) on attempt {}. Standard architecture.",
+                        target_parent.0 as isize, attempt);
+                    break;
+                } else if !data.shell_view_parent.is_invalid() {
+                    // Fallback: no sibling WorkerW — inject into SHELLDLL_DefView's parent directly
+                    target_parent = data.shell_view_parent;
+                    info!("[detect_desktop] Sibling WorkerW missing. Falling back to SHELLDLL_DefView parent (0x{:X}) on attempt {}.",
+                        target_parent.0 as isize, attempt);
+                    break;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         if target_parent.is_invalid() {
-            return Err("Desktop detection failed. Could not locate WorkerW sibling.".to_string());
+            return Err("Desktop detection failed. Could not locate SHELLDLL_DefView hierarchy.".to_string());
         }
 
         // Find SysListView32 (desktop icons) for hide/show support
@@ -136,21 +164,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             BOOL(1)
         }
-
-        // Locate SHELLDLL_DefView to find icons inside it
-        let mut active_sv = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-        if active_sv.is_invalid() {
-            unsafe extern "system" fn find_sv_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-                let s = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-                if !s.is_invalid() { *(lp.0 as *mut HWND) = s; return BOOL(0); }
-                BOOL(1)
-            }
-            let _ = EnumWindows(Some(find_sv_cb), LPARAM(&mut active_sv as *mut _ as isize));
-        }
-
-        if !active_sv.is_invalid() {
-            let _ = EnumChildWindows(active_sv, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
-        }
+        let _ = EnumChildWindows(shell_view, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
 
         if syslistview.is_invalid() {
             warn!("[detect_desktop] SysListView32 not found!");
@@ -211,11 +225,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         ex_style |= WS_EX_NOACTIVATE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
-        // Ensure WorkerW host is visible before injecting
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
-
         let _ = SetParent(our_hwnd, detection.target_parent);
 
+        // HWND_BOTTOM placement ensures we're behind desktop icons
         let _ = SetWindowPos(
             our_hwnd, HWND_BOTTOM,
             detection.v_x, detection.v_y, detection.v_width, detection.v_height,
@@ -224,13 +237,7 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 
         let _ = ShowWindow(our_hwnd, SW_SHOW);
 
-        let final_parent = GetParent(our_hwnd).unwrap_or_default();
-        let is_visible = IsWindowVisible(our_hwnd).as_bool();
-
-        info!(
-            "[apply_injection] Injection Complete. Parent=0x{:X}, Visible={}, Rect=({}, {}, {}x{})",
-            final_parent.0 as isize, is_visible, detection.v_x, detection.v_y, detection.v_width, detection.v_height
-        );
+        info!("[apply_injection] Injection Complete. Parent=0x{:X}", detection.target_parent.0 as isize);
     }
 }
 
