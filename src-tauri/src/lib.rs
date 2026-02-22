@@ -103,8 +103,6 @@ fn start_with_tauri_webview() {
                 // Lancement de l'architecture universelle (Derrière les icônes)
                 window_layer::setup_desktop_window(&window);
                 
-                // Démarrage du Watchdog de performance
-                window_layer::visibility_watchdog::start(handle.clone());
             }
 
             info!("Application setup complete");
