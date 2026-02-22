@@ -490,15 +490,21 @@ pub mod mouse_hook {
                 let hwnd_under = WindowFromPoint(info_hook.pt);
                 let wv = HWND(wv_raw as *mut _);
 
-                // Smart log: only on boundary crossing
+                // Smart log: boundary crossing + periodic (1/sec) always-log
                 static LAST_HWND_UNDER: AtomicIsize = AtomicIsize::new(0);
+                static LAST_TICK: AtomicIsize = AtomicIsize::new(0);
                 let prev = LAST_HWND_UNDER.swap(hwnd_under.0 as isize, Ordering::Relaxed);
-                if prev != hwnd_under.0 as isize {
+                let boundary = prev != hwnd_under.0 as isize;
+                let tick = info_hook.time as isize;
+                let periodic = tick.wrapping_sub(LAST_TICK.load(Ordering::Relaxed)) > 1000;
+                if boundary || periodic {
+                    if periodic { LAST_TICK.store(tick, Ordering::Relaxed); }
                     let mut cls = [0u16; 64];
                     let len = GetClassNameW(hwnd_under, &mut cls);
                     let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
                     let over = is_over_desktop(hwnd_under);
-                    info!("[hook] cursor → 0x{:X} '{}' is_over_desktop={}", hwnd_under.0 as isize, cls_name, over);
+                    let tag = if boundary { "cursor→" } else { "tick   " };
+                    info!("[hook] {} 0x{:X} '{}' is_over_desktop={}", tag, hwnd_under.0 as isize, cls_name, over);
                 }
 
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
