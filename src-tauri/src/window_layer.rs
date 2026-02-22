@@ -500,7 +500,7 @@ pub mod mouse_hook {
                 } else if !is_move {
                     // On ne loggue que les clics et molettes pour éviter le spam,
                     // mais cela confirme que l'envoi vers WebView2 est un succès !
-                    debug!("[dispatch_wnd_proc] Wry Dispatch Success -> Kind: 0x{:X}, VK: {}, Pos: ({},{})", kind, vk, x, y);
+                    info!("[dispatch_wnd_proc] Wry Dispatch Success -> Kind: 0x{:X}, VK: {}, Pos: ({},{})", kind, vk, x, y);
                 }
             }
             return LRESULT(0);
@@ -689,7 +689,7 @@ pub mod mouse_hook {
                     let mut cls = [0u16; 64];
                     let len = GetClassNameW(hwnd_under, &mut cls);
                     let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-                    debug!("[hook_proc] [SMART LOG] Mouse crossed boundary -> HWND: 0x{:X} (Class: '{}')", hwnd_under.0 as isize, cls_name);
+                    info!("[hook_proc] [SMART LOG] Mouse crossed boundary -> HWND: 0x{:X} (Class: '{}')", hwnd_under.0 as isize, cls_name);
                 }
 
                 if !is_over_desktop(hwnd_under) {
@@ -704,9 +704,9 @@ pub mod mouse_hook {
 
                 if is_icon != prev_icon {
                     if is_icon {
-                        debug!("[hook_proc] [SMART LOG] Hovering Desktop Icon. Interactions will be Native.");
+                        info!("[hook_proc] [SMART LOG] Hovering Desktop Icon. Interactions will be Native.");
                     } else {
-                        debug!("[hook_proc] [SMART LOG] Left Desktop Icon. Interactions will be WebView.");
+                        info!("[hook_proc] [SMART LOG] Left Desktop Icon. Interactions will be WebView.");
                     }
                 }
 
@@ -715,7 +715,7 @@ pub mod mouse_hook {
                 // STATE_NATIVE (Interacting with a real Desktop Icon)
                 if state == STATE_NATIVE {
                     if is_up {
-                        debug!("[hook_proc] [STATE] Mouse UP received. Transition: NATIVE -> IDLE.");
+                        info!("[hook_proc] [STATE] Mouse UP received. Transition: NATIVE -> IDLE.");
                         HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -728,7 +728,7 @@ pub mod mouse_hook {
                     let _ = ScreenToClient(wv, &mut cp);
                     forward(msg, &info, cp.x, cp.y);
                     if is_up {
-                        debug!("[hook_proc] [STATE] Mouse UP received. Transition: DRAGGING -> IDLE.");
+                        info!("[hook_proc] [STATE] Mouse UP received. Transition: DRAGGING -> IDLE.");
                         HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                     }
                     if msg == WM_MOUSEMOVE {
@@ -740,11 +740,11 @@ pub mod mouse_hook {
                 // Evaluate Desktop Icon Intersection on Clicks
                 if is_down {
                     if is_icon {
-                        debug!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info.pt.x, info.pt.y);
+                        info!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info.pt.x, info.pt.y);
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
-                    debug!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info.pt.x, info.pt.y);
+                    info!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info.pt.x, info.pt.y);
                     HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
