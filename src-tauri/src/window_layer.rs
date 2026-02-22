@@ -280,7 +280,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         detection.parent_width, detection.parent_height,
         our_hwnd.0 as isize);
 
-    mouse_hook::set_our_pid(std::process::id());
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
     if !detection.syslistview.is_invalid() {
@@ -324,7 +323,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                             mouse_hook::set_chrome_rwhh(target.0 as isize);
                             log::info!("[diag] Chrome_RWHH=0x{:X}", target.0 as isize);
                         } else {
-                            log::warn!("[diag] Chrome_RenderWidgetHostHWND not found, falling back to PID check");
+                            log::warn!("[diag] Chrome_RenderWidgetHostHWND not found via FindWindowExW, relying on IsChild(wv) fallback");
                         }
                     }
                 }
@@ -379,11 +378,11 @@ pub mod mouse_hook {
     static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
-    static OUR_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
 
     const STATE_IDLE: u8 = 0;
     const STATE_DRAGGING: u8 = 1;
+    const STATE_NATIVE: u8 = 2;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
     // Diagnostic: log first N events at each stage
@@ -402,7 +401,6 @@ pub mod mouse_hook {
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
     pub fn get_dispatch_hwnd() -> isize { DISPATCH_HWND.load(Ordering::SeqCst) }
-    pub fn set_our_pid(pid: u32) { OUR_PID.store(pid, Ordering::SeqCst); }
     pub fn set_chrome_rwhh(h: isize) { CHROME_RWHH.store(h, Ordering::SeqCst); }
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub const WM_MWP_SETBOUNDS_PUB: u32 = WM_MWP_SETBOUNDS;
@@ -480,9 +478,10 @@ pub mod mouse_hook {
     }
 
     /// Cursor is over the desktop area. Checks:
-    /// 1. Direct hit on target_parent, SysListView32, or Chrome_RenderWidgetHostHWND
+    /// 1. Direct hit on target_parent, SysListView32, or cached Chrome_RenderWidgetHostHWND
     /// 2. Child of target_parent (SHELLDLL_DefView, our Tauri Window, etc.)
-    /// 3. Fallback: same-process PID (catches any other WebView2 internal window)
+    /// 3. Child of WebView HWND (catches Chrome_RenderWidgetHostHWND in composition mode —
+    ///    it runs in a separate renderer process so PID check won't work)
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
@@ -493,16 +492,17 @@ pub mod mouse_hook {
             || (!rwhh.is_invalid() && hwnd_under == rwhh) {
             return true;
         }
-        // HWND tree walk
+        // HWND tree walk: child of target_parent (Progman/WorkerW)
         if IsChild(tp, hwnd_under).as_bool() {
             return true;
         }
-        // Fallback: PID check for any other detached WebView2 windows
-        let our_pid = OUR_PID.load(Ordering::Relaxed);
-        if our_pid == 0 { return false; }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
-        pid == our_pid
+        // Child of WebView HWND — catches Chrome_RenderWidgetHostHWND etc.
+        // (runs in Chromium renderer process, not our PID)
+        let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+        if !wv.is_invalid() && IsChild(wv, hwnd_under).as_bool() {
+            return true;
+        }
+        false
     }
 
     #[inline]
@@ -526,8 +526,52 @@ pub mod mouse_hook {
         }
     }
 
+    /// Check if mouse is over a desktop icon using Windows Accessibility API.
+    /// Returns true if `accHitTest` at (x,y) returns a child object (VT_DISPATCH).
+    /// Requires COM to be initialized on the calling thread.
+    #[inline]
+    unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+        use windows::core::VARIANT;
+        use windows::Win32::Foundation::POINT;
+
+        let pt = POINT { x, y };
+        let mut p_acc: Option<IAccessible> = None;
+        let mut var_child = VARIANT::default();
+        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
+            if let Some(acc) = p_acc {
+                // accHitTest returns VARIANT:
+                // - VT_I4 with CHILDID_SELF (0) = background, no icon
+                // - VT_DISPATCH = child accessible object = icon
+                match acc.accHitTest(x, y) {
+                    Ok(hit) => {
+                        if let Ok(val) = i32::try_from(&hit) {
+                            val > 0 // positive child ID = icon
+                        } else {
+                            // Only VT_DISPATCH (=9) means a child object (icon).
+                            // VT_EMPTY, VT_NULL, or any other type = not an icon.
+                            let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                            vt == 9 // VT_DISPATCH
+                        }
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn start_hook_thread() {
         std::thread::spawn(|| {
+            // Initialize COM for Accessibility API (accHitTest) on this thread
+            unsafe {
+                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+
             unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 if code < 0 {
                     return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -542,9 +586,16 @@ pub mod mouse_hook {
                 let wv = HWND(wv_raw as *mut _);
                 let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
                 let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
+                let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                // DRAGGING: forward everything until button up
-                if HOOK_STATE.load(Ordering::Relaxed) == STATE_DRAGGING {
+                // STATE_NATIVE: desktop icon interaction — pass everything through to Windows
+                if state == STATE_NATIVE {
+                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                }
+
+                // STATE_DRAGGING: forward everything to WebView until button up
+                if state == STATE_DRAGGING {
                     use windows::Win32::Graphics::Gdi::ScreenToClient;
                     let mut cp = info.pt;
                     let _ = ScreenToClient(wv, &mut cp);
@@ -554,7 +605,7 @@ pub mod mouse_hook {
                     return LRESULT(1);
                 }
 
-                // IDLE: check if over desktop
+                // STATE_IDLE: check if over desktop area
                 let hwnd_under = WindowFromPoint(info.pt);
                 if !is_over_desktop(hwnd_under) {
                     // Log first 3 misses so we know what HWND is blocking
@@ -563,19 +614,29 @@ pub mod mouse_hook {
                         if count < 3 {
                             let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
                             let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-                            let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
+                            let wv_diag = WEBVIEW_HWND.load(Ordering::Relaxed);
                             let mut cls = [0u16; 64];
                             let len = GetClassNameW(hwnd_under, &mut cls);
                             let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-                            log::warn!("[diag] MISS {}/3: under=0x{:X} class='{}' pt=({},{}) tp=0x{:X} slv=0x{:X} wv=0x{:X} isChild={}",
+                            log::warn!("[diag] MISS {}/3: under=0x{:X} class='{}' pt=({},{}) tp=0x{:X} slv=0x{:X} wv=0x{:X} isChild(tp)={} isChild(wv)={}",
                                 count+1, hwnd_under.0 as isize, cls_name, info.pt.x, info.pt.y,
-                                tp, slv, wv,
-                                IsChild(HWND(tp as *mut _), hwnd_under).as_bool());
+                                tp, slv, wv_diag,
+                                IsChild(HWND(tp as *mut _), hwnd_under).as_bool(),
+                                IsChild(HWND(wv_diag as *mut _), hwnd_under).as_bool());
                         } else {
                             DIAG_MISS_LOGGED.store(true, Ordering::Relaxed);
                         }
                     }
                     return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                }
+
+                // On button down: decide NATIVE (icon click) vs DRAGGING (WebView)
+                if is_down {
+                    if is_mouse_over_desktop_icon(info.pt.x, info.pt.y) {
+                        HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
+                        return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                    }
+                    HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -589,7 +650,6 @@ pub mod mouse_hook {
                         hwnd_under.0 as isize, tp, slv, wv_raw, info.pt.x, info.pt.y, cp.x, cp.y, stc_ok, msg);
                 }
                 forward(msg, &info, cp.x, cp.y);
-                if is_down { HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed); }
                 if msg == WM_MOUSEMOVE { return CallNextHookEx(HHOOK::default(), code, wparam, lparam); }
                 LRESULT(1)
             }
