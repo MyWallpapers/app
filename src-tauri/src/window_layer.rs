@@ -738,30 +738,6 @@ pub mod mouse_hook {
     /// Tick counter for throttled icon hover checks (every 8th MOUSE_MOVE)
     static ICON_CHECK_TICK: AtomicU32 = AtomicU32::new(0);
 
-    /// Whether WS_EX_TRANSPARENT is currently set on the WebView HWND.
-    /// When true, the system's hit-testing skips our HWND — events reach SysListView32 naturally.
-    static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
-
-    /// Toggle WS_EX_TRANSPARENT on the WebView HWND. Combined with WS_EX_LAYERED
-    /// (set during injection), this makes the window click-through: the system's
-    /// WindowFromPoint skips our HWND, and events reach SysListView32 naturally
-    /// via CallNextHookEx. Uses atomic caching to avoid redundant SetWindowLongW calls.
-    #[inline]
-    unsafe fn ensure_webview_transparent(transparent: bool) {
-        if WV_TRANSPARENT.load(Ordering::Relaxed) == transparent { return; }
-        let wv = get_webview_hwnd();
-        if wv == 0 { return; }
-        let hwnd = HWND(wv as *mut core::ffi::c_void);
-        let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        if transparent {
-            ex_style |= WS_EX_TRANSPARENT.0;
-        } else {
-            ex_style &= !WS_EX_TRANSPARENT.0;
-        }
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
-        WV_TRANSPARENT.store(transparent, Ordering::Relaxed);
-    }
-
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
     /// Only recomputes when the window under cursor changes.
     #[inline]
@@ -900,10 +876,12 @@ pub mod mouse_hook {
                         // WS_EX_TRANSPARENT is set on our HWND — the system's hit-testing
                         // skips us and events reach SysListView32 naturally via CallNextHookEx.
                         // This enables clicks, double-click, hover, drag & drop, and context menus.
+                        // ── Fast path: STATE_NATIVE ──
+                        // Our HWND is behind SHELLDLL_DefView in Z-order, so events
+                        // reach SysListView32 naturally via CallNextHookEx.
                         if state == STATE_NATIVE {
                             if is_up {
                                 DRAG_VK.store(0, Ordering::Relaxed);
-                                ensure_webview_transparent(false);
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -927,7 +905,6 @@ pub mod mouse_hook {
 
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
-                            ensure_webview_transparent(false);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
@@ -944,10 +921,10 @@ pub mod mouse_hook {
                                 HOVER_Y.store(pt.y, Ordering::Relaxed);
                                 NEEDS_ICON_CHECK.store(true, Ordering::Relaxed);
                             }
-                            // If hovering over icon, make our HWND click-through
-                            // so native hover highlighting and cursor work naturally.
+                            // If hovering over icon, let the event pass through
+                            // to SHELLDLL_DefView (above us in Z-order) for native
+                            // hover highlighting. Don't forward to WebView.
                             if OVER_ICON.load(Ordering::Relaxed) {
-                                ensure_webview_transparent(true);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                         }
@@ -961,10 +938,8 @@ pub mod mouse_hook {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 if msg == WM_LBUTTONDOWN { DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed); }
                                 else if msg == WM_RBUTTONDOWN { DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed); }
-                                // Set WS_EX_TRANSPARENT so the system's hit-testing skips our HWND.
-                                // Combined with WS_EX_LAYERED, this makes us click-through.
+                                // Our HWND is behind SHELLDLL_DefView in Z-order.
                                 // CallNextHookEx lets the event reach SysListView32 naturally.
-                                ensure_webview_transparent(true);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
@@ -975,12 +950,10 @@ pub mod mouse_hook {
 
                         // If hovering over icon in IDLE, let events pass through.
                         if OVER_ICON.load(Ordering::Relaxed) {
-                            ensure_webview_transparent(true);
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
                         // Forward to WebView (hover moves in IDLE + first click IDLE→WEB)
-                        ensure_webview_transparent(false);
                         use windows::Win32::Graphics::Gdi::ScreenToClient;
                         let mut client_pt = pt;
                         let _ = ScreenToClient(wv, &mut client_pt);
