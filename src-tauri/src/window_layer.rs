@@ -213,7 +213,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
                 mouse_hook::set_comp_controller_ptr(ptr);
-                unsafe { let _ = wry::set_controller_bounds_raw(ptr, w, h); }
+                let bounds_result = unsafe { wry::set_controller_bounds_raw(ptr, w, h) };
+                log::info!("[diag] CompController=0x{:X} bounds={}x{} result={:?}", ptr, w, h, bounds_result);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -232,7 +233,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -262,6 +263,10 @@ pub mod mouse_hook {
     const STATE_DRAGGING: u8 = 1;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
+    // Diagnostic: log first events at each stage
+    static DIAG_HOOK: AtomicBool = AtomicBool::new(true);
+    static DIAG_DISPATCH: AtomicBool = AtomicBool::new(true);
+
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
 
     pub fn set_webview_hwnd(h: isize)        { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
@@ -288,6 +293,9 @@ pub mod mouse_hook {
             let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let ptr = get_comp_controller_ptr();
+            if DIAG_DISPATCH.swap(false, Ordering::Relaxed) {
+                log::info!("[diag] dispatch: kind=0x{:X} x={} y={} ptr=0x{:X}", kind, x, y, ptr);
+            }
             if ptr != 0 { let _ = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y); }
             return LRESULT(0);
         }
@@ -367,8 +375,16 @@ pub mod mouse_hook {
                 }
 
                 // IDLE: check if over desktop
-                if !is_over_desktop(WindowFromPoint(info.pt)) {
+                let hwnd_under = WindowFromPoint(info.pt);
+                if !is_over_desktop(hwnd_under) {
                     return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                }
+
+                if DIAG_HOOK.swap(false, Ordering::Relaxed) {
+                    let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
+                    let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
+                    log::info!("[diag] hook hit: under=0x{:X} tp=0x{:X} slv=0x{:X} wv=0x{:X} screen=({},{}) msg=0x{:X}",
+                        hwnd_under.0 as isize, tp, slv, wv_raw, info.pt.x, info.pt.y, msg);
                 }
 
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
