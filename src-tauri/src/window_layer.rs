@@ -233,6 +233,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     apply_injection(our_hwnd, &detection);
 
     mouse_hook::init_dispatch_window();
+    info!("[ensure_in_worker_w] Dispatch window created. HWND: 0x{:X}", mouse_hook::get_dispatch_hwnd());
 
     let (w, h) = (detection.v_width, detection.v_height);
 
@@ -240,15 +241,17 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-        for _ in 1..=100 {
+        for attempt in 1..=100 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
+                info!("[WRY_POLL] CompositionController acquired at 0x{:X} on attempt {}", ptr, attempt);
                 mouse_hook::set_comp_controller_ptr(ptr);
                 let dh = mouse_hook::get_dispatch_hwnd();
                 if dh != 0 {
                     unsafe {
                         let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB, WPARAM(w as usize), LPARAM(h as isize));
                     }
+                    info!("[WRY_POLL] Bounds set to {}x{}", w, h);
                 }
                 break;
             }
@@ -332,6 +335,9 @@ pub mod mouse_hook {
             let _ = RegisterClassW(&wc);
             if let Ok(h) = CreateWindowExW(WINDOW_EX_STYLE(0), cls, windows::core::w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, None, None) {
                 DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                info!("[init_dispatch_window] Message-only window created: 0x{:X}", h.0 as isize);
+            } else {
+                error!("[init_dispatch_window] Failed to create dispatch window!");
             }
         }
     }
@@ -353,6 +359,7 @@ pub mod mouse_hook {
 
             if cls_name == "Chrome_RenderWidgetHostHWND" {
                 CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                info!("[is_over_desktop] Chrome_RWHH auto-discovered at 0x{:X}", hwnd_under.0 as isize);
                 return true;
             }
         }
@@ -478,6 +485,9 @@ pub mod mouse_hook {
             unsafe {
                 if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
                     crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
+                    info!("[start_hook_thread] WH_MOUSE_LL hook installed: 0x{:X}", h.0 as isize);
+                } else {
+                    error!("[start_hook_thread] FAILED to install WH_MOUSE_LL hook!");
                 }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
