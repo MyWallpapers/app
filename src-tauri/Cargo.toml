@@ -1,6 +1,6 @@
 [package]
 name = "mywallpaper-desktop"
-version = "1.0.182"
+version = "1.0.183"
 description = "MyWallpaper Desktop - Animated Wallpaper Application"
 authors = ["MyWallpaper Team"]
 license = "MIT"
