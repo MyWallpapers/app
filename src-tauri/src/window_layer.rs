@@ -181,8 +181,81 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             0, 0, detection.parent_width, detection.parent_height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-        info!("Injected: {}x{} ({})", detection.parent_width, detection.parent_height,
-            if detection.is_24h2 { "24H2" } else { "Legacy" });
+        // Verify injection
+        let actual_parent = GetParent(our_hwnd).unwrap_or_default();
+        let parent_ok = actual_parent == detection.target_parent;
+        let visible = IsWindowVisible(our_hwnd).as_bool();
+        info!("[diag] Injected: {}x{} ({}) parent_ok={} visible={} actual_parent=0x{:X}",
+            detection.parent_width, detection.parent_height,
+            if detection.is_24h2 { "24H2" } else { "Legacy" },
+            parent_ok, visible, actual_parent.0 as isize);
+    }
+}
+
+// ============================================================================
+// Windows: State Dump (diagnostic)
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn dump_state(our_hwnd: windows::Win32::Foundation::HWND, det: &DesktopDetection) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::Win32::Foundation::RECT;
+
+    unsafe {
+        // Helper: get window info string
+        let describe = |hwnd: HWND, label: &str| -> String {
+            if hwnd.is_invalid() { return format!("  {} = NULL", label); }
+            let mut cls = [0u16; 64];
+            let len = GetClassNameW(hwnd, &mut cls);
+            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            let exstyle = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let mut r = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut r);
+            let visible = IsWindowVisible(hwnd).as_bool();
+            let parent = GetParent(hwnd).unwrap_or_default();
+            format!("  {} = 0x{:X} class='{}' rect=({},{},{},{}) {}x{} style=0x{:08X} exstyle=0x{:08X} visible={} parent=0x{:X}",
+                label, hwnd.0 as isize, cls_name,
+                r.left, r.top, r.right, r.bottom, r.right - r.left, r.bottom - r.top,
+                style, exstyle, visible, parent.0 as isize)
+        };
+
+        // Enumerate children of target_parent for Z-order
+        let mut children = Vec::new();
+        let mut child = GetWindow(det.target_parent, GW_CHILD).unwrap_or_default();
+        for _ in 0..20 {
+            if child.is_invalid() { break; }
+            let mut cls = [0u16; 64];
+            let len = GetClassNameW(child, &mut cls);
+            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+            let visible = IsWindowVisible(child).as_bool();
+            children.push(format!("0x{:X}({}{})", child.0 as isize, cls_name, if visible { "" } else { ",hidden" }));
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+        }
+
+        // Get screen info
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+
+        let dump = format!(
+            "[diag] === STATE DUMP ===\n\
+            [diag] Screen: {}x{}\n\
+            {}\n{}\n{}\n{}\n{}\n\
+            [diag] Z-order in target_parent (top→bottom): [{}]\n\
+            [diag] === END DUMP ===",
+            screen_w, screen_h,
+            describe(det.target_parent, "target_parent"),
+            describe(det.shell_view, "shell_view"),
+            describe(det.os_workerw, "os_workerw"),
+            describe(det.syslistview, "syslistview"),
+            describe(our_hwnd, "our_hwnd"),
+            children.join(", "),
+        );
+
+        for line in dump.lines() {
+            info!("{}", line);
+        }
     }
 }
 
@@ -214,6 +287,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     }
 
     apply_injection(our_hwnd, &detection);
+
+    // State dump: window hierarchy, styles, positions, Z-order
+    dump_state(our_hwnd, &detection);
 
     // WebView2 bounds — always poll (controller may not be ready yet)
     let (w, h) = (detection.parent_width, detection.parent_height);
@@ -287,13 +363,24 @@ pub mod mouse_hook {
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
 
+    static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
+
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
-        if dh == 0 { return; }
+        if dh == 0 {
+            if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
+                log::error!("[diag] post_mouse: DISPATCH_HWND=0, events lost");
+            }
+            return;
+        }
         let wp = WPARAM((kind as u16 as usize) | ((vk as u16 as usize) << 16) | ((data as usize) << 32));
         let lp = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
-        let _ = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp);
+        if let Err(e) = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp) {
+            if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
+                log::error!("[diag] PostMessageW FAILED: {} dh=0x{:X}", e, dh);
+            }
+        }
     }
 
     unsafe extern "system" fn dispatch_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -421,16 +508,16 @@ pub mod mouse_hook {
                     return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                 }
 
+                use windows::Win32::Graphics::Gdi::ScreenToClient;
+                let mut cp = info.pt;
+                let stc_ok = ScreenToClient(wv, &mut cp).as_bool();
+
                 if DIAG_HOOK.swap(false, Ordering::Relaxed) {
                     let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
                     let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-                    log::info!("[diag] hook hit: under=0x{:X} tp=0x{:X} slv=0x{:X} wv=0x{:X} screen=({},{}) msg=0x{:X}",
-                        hwnd_under.0 as isize, tp, slv, wv_raw, info.pt.x, info.pt.y, msg);
+                    log::info!("[diag] hook hit: under=0x{:X} tp=0x{:X} slv=0x{:X} wv=0x{:X} screen=({},{}) client=({},{}) stc_ok={} msg=0x{:X}",
+                        hwnd_under.0 as isize, tp, slv, wv_raw, info.pt.x, info.pt.y, cp.x, cp.y, stc_ok, msg);
                 }
-
-                use windows::Win32::Graphics::Gdi::ScreenToClient;
-                let mut cp = info.pt;
-                let _ = ScreenToClient(wv, &mut cp);
                 forward(msg, &info, cp.x, cp.y);
                 if is_down { HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed); }
                 if msg == WM_MOUSEMOVE { return CallNextHookEx(HHOOK::default(), code, wparam, lparam); }
