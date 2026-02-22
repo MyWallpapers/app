@@ -55,6 +55,7 @@ fn start_with_tauri_webview() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(if cfg!(debug_assertions) { log::LevelFilter::Debug } else { log::LevelFilter::Info })
+                .clear_targets()
                 .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview))
                 .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None }))
                 .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout))
