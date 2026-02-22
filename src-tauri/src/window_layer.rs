@@ -175,7 +175,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     unsafe {
@@ -206,6 +206,18 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         info!("[apply_injection] Injection Complete. Parent=0x{:X}, Size={}x{} at {},{}",
             detection.target_parent.0 as isize, detection.v_width, detection.v_height,
             detection.v_x, detection.v_y);
+
+        // Verify actual window rects after injection
+        let mut parent_rect = RECT::default();
+        let mut our_rect = RECT::default();
+        let _ = GetWindowRect(detection.target_parent, &mut parent_rect);
+        let _ = GetWindowRect(our_hwnd, &mut our_rect);
+        info!("[apply_injection] Parent RECT: ({},{})→({},{}) = {}x{}",
+            parent_rect.left, parent_rect.top, parent_rect.right, parent_rect.bottom,
+            parent_rect.right - parent_rect.left, parent_rect.bottom - parent_rect.top);
+        info!("[apply_injection] Our RECT: ({},{})→({},{}) = {}x{}",
+            our_rect.left, our_rect.top, our_rect.right, our_rect.bottom,
+            our_rect.right - our_rect.left, our_rect.bottom - our_rect.top);
     }
 }
 
@@ -457,7 +469,7 @@ pub mod mouse_hook {
                     return LRESULT(1);
                 }
 
-                // When icons are hidden, all clicks go natively to WebView2
+                // Check if icons are visible for native icon interaction
                 let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
                 let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
 
@@ -473,10 +485,8 @@ pub mod mouse_hook {
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
 
-                // When icons are hidden, WebView2 handles clicks natively — no Wry forwarding
-                if icons_visible {
-                    forward(msg, &info_hook, cp.x, cp.y);
-                }
+                // Always forward to Wry — WebView2 can't receive clicks natively in desktop layer
+                forward(msg, &info_hook, cp.x, cp.y);
 
                 if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                 LRESULT(1)
