@@ -21,7 +21,7 @@ pub static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
     {
-        info!("[window_layer] Starting desktop window setup...");
+        info!("[window_layer] Starting desktop window setup phase...");
         if let Err(e) = ensure_in_worker_w(_window) {
             error!("[window_layer] CRITICAL: Failed to setup desktop layer: {}", e);
         } else {
@@ -37,17 +37,11 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
         let slv = mouse_hook::get_syslistview_hwnd();
-        debug!("[window_layer] set_desktop_icons_visible requested: visible={}, slv=0x{:X}", _visible, slv);
         if slv != 0 {
             unsafe {
-                let _ = ShowWindow(
-                    HWND(slv as *mut _),
-                    if _visible { SW_SHOW } else { SW_HIDE },
-                );
+                let _ = ShowWindow(HWND(slv as *mut _), if _visible { SW_SHOW } else { SW_HIDE });
             }
             info!("[window_layer] Desktop icons visibility set to {}", _visible);
-        } else {
-            warn!("[window_layer] Cannot change icon visibility: SysListView32 HWND is 0");
         }
     }
     Ok(())
@@ -56,19 +50,20 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
 pub fn restore_desktop_icons() {
     #[cfg(target_os = "windows")]
     {
-        if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
-            debug!("[window_layer] restore_desktop_icons called, but already restored.");
-            return;
-        }
+        if ICONS_RESTORED.swap(true, Ordering::SeqCst) { return; }
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW, UnhookWindowsHookEx, HHOOK};
+
         let slv = mouse_hook::get_syslistview_hwnd();
-        debug!("[window_layer] Executing safety restore of desktop icons. slv=0x{:X}", slv);
         if slv != 0 {
-            unsafe {
-                let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW);
-            }
+            unsafe { let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW); }
             info!("[window_layer] Desktop icons successfully restored on exit.");
+        }
+
+        let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
+        if hook_ptr != 0 {
+            unsafe { let _ = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)); }
+            info!("[window_layer] WH_MOUSE_LL hook successfully uninstalled.");
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -76,7 +71,7 @@ pub fn restore_desktop_icons() {
 }
 
 // ============================================================================
-// Windows: Desktop Detection (Modern Win10/Win11)
+// Windows: Desktop Detection (Universal WorkerW Standard Method)
 // ============================================================================
 
 #[cfg(target_os = "windows")]
@@ -101,57 +96,39 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         info!("[detect_desktop] Found Progman HWND: 0x{:X}", progman.0 as isize);
 
-        // Force Windows to create the special wallpaper WorkerW
+        // Force Windows to split the desktop and create the background WorkerW
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
+        // Universal method: EnumWindows to find the WorkerW sibling of SHELLDLL_DefView's parent
         let mut target_parent = HWND::default();
-        let mut shell_view = HWND::default();
+
+        unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+            let sv = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+            if !sv.is_invalid() {
+                let target = &mut *(lp.0 as *mut HWND);
+                *target = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
+            }
+            BOOL(1)
+        }
 
         for attempt in 1..=40 {
-            // Check for Windows 11 24H2+ layout
-            let sv = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-            let ww = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or_default();
-
-            if !sv.is_invalid() && !ww.is_invalid() {
-                info!("[detect_desktop] Discovered Windows 11 24H2+ architecture on attempt {}", attempt);
-                target_parent = ww;
-                shell_view = sv;
-                break;
-            }
-
-            // Standard Win10/Win11 layout
-            struct ModernData { bg_worker: HWND, shell_view: HWND }
-            let mut md = ModernData { bg_worker: HWND::default(), shell_view: HWND::default() };
-
-            unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-                let d = &mut *(lp.0 as *mut ModernData);
-                let s = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-                if !s.is_invalid() {
-                    d.shell_view = s;
-                    let bg_w = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
-                    if !bg_w.is_invalid() { d.bg_worker = bg_w; }
-                    return BOOL(0);
-                }
-                BOOL(1)
-            }
-            let _ = EnumWindows(Some(cb), LPARAM(&mut md as *mut _ as isize));
-            if !md.bg_worker.is_invalid() && !md.shell_view.is_invalid() {
-                info!("[detect_desktop] Discovered Standard Win10/Win11 architecture on attempt {}", attempt);
-                target_parent = md.bg_worker;
-                shell_view = md.shell_view;
+            let _ = EnumWindows(Some(enum_windows_cb), LPARAM(&mut target_parent as *mut _ as isize));
+            if !target_parent.is_invalid() {
+                info!("[detect_desktop] Found WorkerW target on attempt {}: 0x{:X}", attempt, target_parent.0 as isize);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         if target_parent.is_invalid() {
-            return Err("Failed to locate WorkerW hierarchy.".to_string());
+            return Err("Desktop detection failed. Could not locate WorkerW sibling.".to_string());
         }
 
+        // Find SysListView32 (desktop icons) for hide/show support
         let mut syslistview = HWND::default();
         unsafe extern "system" fn find_slv(hwnd: HWND, lp: LPARAM) -> BOOL {
-            let mut buf = [0u16; 256];
+            let mut buf = [0u16; 64];
             let len = GetClassNameW(hwnd, &mut buf);
             if String::from_utf16_lossy(&buf[..len as usize]) == "SysListView32" {
                 *(lp.0 as *mut HWND) = hwnd;
@@ -159,7 +136,21 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             BOOL(1)
         }
-        let _ = EnumChildWindows(shell_view, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+
+        // Locate SHELLDLL_DefView to find icons inside it
+        let mut active_sv = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+        if active_sv.is_invalid() {
+            unsafe extern "system" fn find_sv_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+                let s = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+                if !s.is_invalid() { *(lp.0 as *mut HWND) = s; return BOOL(0); }
+                BOOL(1)
+            }
+            let _ = EnumWindows(Some(find_sv_cb), LPARAM(&mut active_sv as *mut _ as isize));
+        }
+
+        if !active_sv.is_invalid() {
+            let _ = EnumChildWindows(active_sv, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+        }
 
         if syslistview.is_invalid() {
             warn!("[detect_desktop] SysListView32 not found!");
@@ -167,15 +158,16 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             info!("[detect_desktop] Found SysListView32 HWND: 0x{:X}", syslistview.0 as isize);
         }
 
-        // Absolute Physical Bounds via EnumDisplayMonitors
+        // Absolute physical bounds via EnumDisplayMonitors
         struct MonitorRects { left: i32, top: i32, right: i32, bottom: i32 }
         let mut m_rects = MonitorRects { left: 0, top: 0, right: 0, bottom: 0 };
         unsafe extern "system" fn monitor_enum_cb(_hm: HMONITOR, _hdc: HDC, rect: *mut RECT, lp: LPARAM) -> BOOL {
             let data = &mut *(lp.0 as *mut MonitorRects);
-            if rect.read().left < data.left { data.left = rect.read().left; }
-            if rect.read().top < data.top { data.top = rect.read().top; }
-            if rect.read().right > data.right { data.right = rect.read().right; }
-            if rect.read().bottom > data.bottom { data.bottom = rect.read().bottom; }
+            let r = *rect;
+            if r.left < data.left { data.left = r.left; }
+            if r.top < data.top { data.top = r.top; }
+            if r.right > data.right { data.right = r.right; }
+            if r.bottom > data.bottom { data.bottom = r.bottom; }
             BOOL(1)
         }
         let _ = EnumDisplayMonitors(HDC::default(), None, Some(monitor_enum_cb), LPARAM(&mut m_rects as *mut _ as isize));
@@ -187,7 +179,8 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         Ok(DesktopDetection {
             target_parent,
             syslistview,
-            v_x: m_rects.left, v_y: m_rects.top,
+            v_x: m_rects.left,
+            v_y: m_rects.top,
             v_width: m_rects.right - m_rects.left,
             v_height: m_rects.bottom - m_rects.top,
         })
@@ -212,32 +205,23 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         style |= WS_CHILD.0 | WS_VISIBLE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
+        // Strip WS_EX_LAYERED to force opaque WebView2 rendering (visibility fix)
         let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
+        ex_style &= !WS_EX_LAYERED.0;
         ex_style |= WS_EX_NOACTIVATE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
-        // Ensure WorkerW is visible before injecting
+        // Ensure WorkerW host is visible before injecting
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
 
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // Standard Z-order placement (works for both 24H2 and Win10/11 now that we target WorkerW)
         let _ = SetWindowPos(
-            our_hwnd,
-            HWND_BOTTOM,
-            0, 0, 0, 0,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
-        );
-
-        let _ = SetWindowPos(
-            our_hwnd,
-            HWND::default(),
+            our_hwnd, HWND_BOTTOM,
             detection.v_x, detection.v_y, detection.v_width, detection.v_height,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         );
 
-        // Force Chromium visual refresh to avoid black screen bug
-        let _ = ShowWindow(our_hwnd, SW_HIDE);
         let _ = ShowWindow(our_hwnd, SW_SHOW);
 
         let final_parent = GetParent(our_hwnd).unwrap_or_default();
@@ -257,8 +241,6 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 #[cfg(target_os = "windows")]
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
-
-    debug!("[ensure_in_worker_w] Forcing ignore_cursor_events on Tauri window...");
     let _ = window.set_ignore_cursor_events(true);
 
     let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
@@ -276,26 +258,21 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     apply_injection(our_hwnd, &detection);
 
-    debug!("[ensure_in_worker_w] Initializing Mouse Dispatch Proxy Window...");
     mouse_hook::init_dispatch_window();
 
     let (w, h) = (detection.v_width, detection.v_height);
 
-    debug!("[ensure_in_worker_w] Spawning Wry Composition Controller polling thread...");
     std::thread::spawn(move || {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-        let mut controller_found = false;
-        for attempt in 1..=100 {
+        for attempt in 1..=200 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
                 info!("[wry_poll] Found Composition Controller at 0x{:X} on attempt {}", ptr, attempt);
                 mouse_hook::set_comp_controller_ptr(ptr);
-
                 let dh = mouse_hook::get_dispatch_hwnd();
                 if dh != 0 {
-                    debug!("[wry_poll] Posting WM_MWP_SETBOUNDS_PUB ({}x{}) to dispatch window 0x{:X}", w, h, dh);
                     unsafe {
                         let _ = PostMessageW(
                             HWND(dh as *mut _),
@@ -304,33 +281,24 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                             LPARAM(h as isize),
                         );
                     }
-                } else {
-                    error!("[wry_poll] Dispatch window is 0! Cannot set bounds.");
                 }
-                controller_found = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-
-        if !controller_found {
-            error!("[wry_poll] CRITICAL: CompositionController not found after 5 seconds of polling! Wallpaper engine will fail to render inputs/bounds.");
-        }
     });
 
-    info!("[ensure_in_worker_w] Starting low-level mouse hook thread...");
     mouse_hook::start_hook_thread();
-
     Ok(())
 }
 
 // ============================================================================
-// Windows: Mouse Hook (WITH SMART LOGGING)
+// Windows: Mouse Hook
 // ============================================================================
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use log::{debug, error, info, warn};
+    use log::{error, info};
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -363,9 +331,6 @@ pub mod mouse_hook {
     const STATE_NATIVE: u8 = 2;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
-    // --- SMART LOGGING TRACKERS ---
-    static LAST_HWND_UNDER: AtomicIsize = AtomicIsize::new(0);
-    static LAST_ICON_STATE: AtomicBool = AtomicBool::new(false);
     static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -382,49 +347,33 @@ pub mod mouse_hook {
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
-        if dh == 0 {
-            if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
-                error!("[mouse_hook] post_mouse dropped: DISPATCH_HWND is 0");
-            }
-            return;
-        }
+        if dh == 0 { return; }
         let wp = WPARAM((kind as u16 as usize) | ((vk as u16 as usize) << 16) | ((data as usize) << 32));
         let lp = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
-        if let Err(e) = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp) {
-            if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
-                error!("[mouse_hook] PostMessageW FAILED to dispatch window 0x{:X}: {}", dh, e);
-            }
-        }
+        let _ = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp);
     }
 
     unsafe extern "system" fn dispatch_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         if msg == WM_MWP_SETBOUNDS_PUB {
-            let w = wp.0 as i32;
-            let h = lp.0 as i32;
             let ptr = get_comp_controller_ptr();
-            debug!("[dispatch_wnd_proc] Received SETBOUNDS: {}x{} for CompPtr 0x{:X}", w, h, ptr);
             if ptr != 0 {
-                let result = wry::set_controller_bounds_raw(ptr, w, h);
-                info!("[dispatch_wnd_proc] SetBounds Applied. Result: {:?}", result);
+                let _ = wry::set_controller_bounds_raw(ptr, wp.0 as i32, lp.0 as i32);
             }
             return LRESULT(0);
         }
         if msg == WM_MWP_MOUSE {
-            let kind = (wp.0 & 0xFFFF) as i32;
-            let vk = ((wp.0 >> 16) & 0xFFFF) as i32;
-            let data = ((wp.0 >> 32) & 0xFFFFFFFF) as u32;
-            let x = (lp.0 & 0xFFFF) as i16 as i32;
-            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let ptr = get_comp_controller_ptr();
-
             if ptr != 0 {
-                let is_move = kind == MOUSE_MOVE;
-                if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
-                    error!("[dispatch_wnd_proc] WRY send_mouse_input_raw FAILED: {}", e);
-                } else if !is_move {
-                    // On ne loggue que les clics et molettes pour éviter le spam,
-                    // mais cela confirme que l'envoi vers WebView2 est un succès !
-                    info!("[dispatch_wnd_proc] Wry Dispatch Success -> Kind: 0x{:X}, VK: {}, Pos: ({},{})", kind, vk, x, y);
+                let kind = (wp.0 & 0xFFFF) as i32;
+                let _ = wry::send_mouse_input_raw(
+                    ptr, kind,
+                    ((wp.0 >> 16) & 0xFFFF) as i32,
+                    ((wp.0 >> 32) & 0xFFFFFFFF) as u32,
+                    (lp.0 & 0xFFFF) as i16 as i32,
+                    ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                if kind != MOUSE_MOVE {
+                    info!("[dispatch_wnd_proc] Click injected to WebView2!");
                 }
             }
             return LRESULT(0);
@@ -441,24 +390,12 @@ pub mod mouse_hook {
                 ..Default::default()
             };
             let _ = RegisterClassW(&wc);
-            match CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                cls,
-                windows::core::w!(""),
-                WINDOW_STYLE(0),
-                0, 0, 0, 0,
-                HWND_MESSAGE,
-                None,
-                None,
-                None,
+            if let Ok(h) = CreateWindowExW(
+                WINDOW_EX_STYLE(0), cls, windows::core::w!(""), WINDOW_STYLE(0),
+                0, 0, 0, 0, HWND_MESSAGE, None, None, None,
             ) {
-                Ok(h) => {
-                    DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
-                    info!("[init_dispatch_window] Proxy window mapped at 0x{:X}", h.0 as isize);
-                }
-                Err(e) => {
-                    error!("[init_dispatch_window] Failed to create proxy window: {}", e);
-                }
+                DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                info!("[init_dispatch_window] Proxy window at 0x{:X}", h.0 as isize);
             }
         }
     }
@@ -466,35 +403,28 @@ pub mod mouse_hook {
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
-        let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
 
         // Fast path 1: Cached Chrome_RenderWidgetHostHWND
-        if !rwhh.is_invalid() && hwnd_under == rwhh {
-            return true;
-        }
+        if !rwhh.is_invalid() && hwnd_under == rwhh { return true; }
         // Fast path 2: Known roots
-        if hwnd_under == tp || hwnd_under == slv || hwnd_under == wv {
-            return true;
-        }
+        if hwnd_under == tp || hwnd_under == wv { return true; }
         // Hierarchy check
         if IsChild(tp, hwnd_under).as_bool() || (!wv.is_invalid() && IsChild(wv, hwnd_under).as_bool()) {
             return true;
         }
 
-        // Auto-discovery of Chrome_RenderWidgetHostHWND
+        // Auto-discovery of Chrome_RenderWidgetHostHWND (string comparison, not hardcoded length)
         if rwhh.is_invalid() {
-            let mut cls = [0u16; 40];
+            let mut cls = [0u16; 64];
             let len = GetClassNameW(hwnd_under, &mut cls) as usize;
-            if len == 31 {
-                const EXPECTED: &[u8] = b"Chrome_RenderWidgetHostHWND";
-                let matches = cls[..len].iter().zip(EXPECTED.iter()).all(|(&c, &e)| c == e as u16);
-                if matches {
-                    CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                    info!("[is_over_desktop] Auto-discovered Chrome_RWHH at 0x{:X}", hwnd_under.0 as isize);
-                    return true;
-                }
+            let cls_name = String::from_utf16_lossy(&cls[..len]);
+
+            if cls_name == "Chrome_RenderWidgetHostHWND" {
+                CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                info!("[is_over_desktop] WebView2 Auto-Discovered! Clicks will now work.");
+                return true;
             }
         }
         false
@@ -517,56 +447,30 @@ pub mod mouse_hook {
                     Ok(hit) => {
                         let vt = hit.as_raw().Anonymous.Anonymous.vt;
                         if vt == VT_I4.0 as u16 {
-                            let val = hit.as_raw().Anonymous.Anonymous.Anonymous.lVal;
-                            val > 0
+                            hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
                         } else {
                             vt == VT_DISPATCH.0 as u16
                         }
                     }
                     Err(_) => false,
                 }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+            } else { false }
+        } else { false }
     }
 
     #[inline]
-    unsafe fn forward(msg: u32, info: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
-        let x = cx;
-        let y = cy;
+    unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
-            WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, x, y),
-            WM_LBUTTONDOWN => {
-                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, x, y);
-            }
-            WM_LBUTTONUP => {
-                DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_LUP, VK_NONE, 0, x, y);
-            }
-            WM_RBUTTONDOWN => {
-                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, x, y);
-            }
-            WM_RBUTTONUP => {
-                DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_RUP, VK_NONE, 0, x, y);
-            }
-            WM_MBUTTONDOWN => {
-                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, x, y);
-            }
-            WM_MBUTTONUP => {
-                DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_MUP, VK_NONE, 0, x, y);
-            }
+            WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, cx, cy),
+            WM_LBUTTONDOWN => { DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, cx, cy); }
+            WM_LBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_LUP, VK_NONE, 0, cx, cy); }
+            WM_RBUTTONDOWN => { DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, cx, cy); }
+            WM_RBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_RUP, VK_NONE, 0, cx, cy); }
+            WM_MBUTTONDOWN => { DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, cx, cy); }
+            WM_MBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_MUP, VK_NONE, 0, cx, cy); }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
                 let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                post_mouse(kind, VK_NONE, delta, x, y);
+                post_mouse(kind, VK_NONE, (info_hook.mouseData >> 16) as i16 as i32 as u32, cx, cy);
             }
             _ => {}
         }
@@ -574,130 +478,72 @@ pub mod mouse_hook {
 
     pub fn start_hook_thread() {
         std::thread::spawn(|| {
-            debug!("[start_hook_thread] Hook thread spawned. Initializing COM...");
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-                let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                if hr.is_err() {
-                    error!("[start_hook_thread] COM Initialization Failed: {:?}", hr);
-                } else {
-                    debug!("[start_hook_thread] COM Initialized (COINIT_APARTMENTTHREADED).");
-                }
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             }
 
             unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                 let hook_h = HHOOK(crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _);
-
-                if code < 0 {
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
+                if code < 0 { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
-                if wv_raw == 0 {
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
+                if wv_raw == 0 { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
                 let info_hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
                 let msg = wparam.0 as u32;
-                let wv = HWND(wv_raw as *mut _);
                 let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
                 let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
 
-                // ==========================================================
-                // SMART LOGGING : DÉTECTION DES CHANGEMENTS DE FENÊTRE
-                // ==========================================================
                 let hwnd_under = WindowFromPoint(info_hook.pt);
-                let prev_hwnd = LAST_HWND_UNDER.swap(hwnd_under.0 as isize, Ordering::Relaxed);
-
-                if prev_hwnd != hwnd_under.0 as isize {
-                    let mut cls = [0u16; 64];
-                    let len = GetClassNameW(hwnd_under, &mut cls);
-                    let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-                    info!("[hook_proc] [SMART LOG] Mouse crossed boundary -> HWND: 0x{:X} (Class: '{}')", hwnd_under.0 as isize, cls_name);
-                }
 
                 if !is_over_desktop(hwnd_under) {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ==========================================================
-                // SMART LOGGING : DÉTECTION DES SURVOLS D'ICÔNES DE BUREAU
-                // ==========================================================
                 let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
-                let prev_icon = LAST_ICON_STATE.swap(is_icon, Ordering::Relaxed);
-
-                if is_icon != prev_icon {
-                    if is_icon {
-                        info!("[hook_proc] [SMART LOG] Hovering Desktop Icon. Interactions will be Native.");
-                    } else {
-                        info!("[hook_proc] [SMART LOG] Left Desktop Icon. Interactions will be WebView.");
-                    }
-                }
-
                 let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                // STATE_NATIVE (Interacting with a real Desktop Icon)
+                // STATE_NATIVE: Interacting with a real desktop icon
                 if state == STATE_NATIVE {
-                    if is_up {
-                        info!("[hook_proc] [STATE] Mouse UP received. Transition: NATIVE -> IDLE.");
-                        HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
-                    }
+                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // STATE_DRAGGING (Holding a click on the WebView, forward everything)
+                // STATE_DRAGGING: Holding a click on the WebView
                 if state == STATE_DRAGGING {
                     use windows::Win32::Graphics::Gdi::ScreenToClient;
                     let mut cp = info_hook.pt;
-                    let _ = ScreenToClient(wv, &mut cp);
+                    let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                     forward(msg, &info_hook, cp.x, cp.y);
-                    if is_up {
-                        info!("[hook_proc] [STATE] Mouse UP received. Transition: DRAGGING -> IDLE.");
-                        HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
-                    }
-                    if msg == WM_MOUSEMOVE {
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
-                    }
+                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                     return LRESULT(1);
                 }
 
-                // Evaluate Desktop Icon Intersection on Clicks
+                // STATE_IDLE: Evaluate click target
                 if is_down {
                     if is_icon {
-                        info!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info_hook.pt.x, info_hook.pt.y);
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
-                    info!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info_hook.pt.x, info_hook.pt.y);
                     HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
-                // Forward Event Coordinates Translated to Client Area
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
-                let _ = ScreenToClient(wv, &mut cp);
-
+                let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                if msg == WM_MOUSEMOVE {
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
+                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                 LRESULT(1)
             }
 
             unsafe {
-                debug!("[start_hook_thread] Installing WH_MOUSE_LL hook...");
-                let hook_result = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
-                match &hook_result {
-                    Ok(h) => {
-                        crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
-                        info!("[start_hook_thread] WH_MOUSE_LL Hook installed successfully: 0x{:X}", h.0 as isize);
-                    }
-                    Err(e) => {
-                        error!("[start_hook_thread] CRITICAL: WH_MOUSE_LL Hook FAILED: {}", e);
-                    }
+                if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
+                    crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
+                    info!("[start_hook_thread] WH_MOUSE_LL Hook installed: 0x{:X}", h.0 as isize);
                 }
-
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                     let _ = TranslateMessage(&msg);
