@@ -360,18 +360,26 @@ pub mod mouse_hook {
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
 
+        // Fast path: known HWNDs
         if !rwhh.is_invalid() && hwnd_under == rwhh { return true; }
         if hwnd_under == tp || hwnd_under == wv { return true; }
-        if IsChild(tp, hwnd_under).as_bool() || (!wv.is_invalid() && IsChild(wv, hwnd_under).as_bool()) { return true; }
 
-        if rwhh.is_invalid() {
+        // Child of our container or WebView
+        let is_child_tp = IsChild(tp, hwnd_under).as_bool();
+        let is_child_wv = !wv.is_invalid() && IsChild(wv, hwnd_under).as_bool();
+        if is_child_tp || is_child_wv { return true; }
+
+        // Auto-discover Chrome_RWHH — ONLY if it's a child of OUR WebView.
+        // Without IsChild check, we'd capture the user's Chrome browser RWHH!
+        if rwhh.is_invalid() && !wv.is_invalid() {
             let mut cls = [0u16; 64];
             let len = GetClassNameW(hwnd_under, &mut cls) as usize;
             let cls_name = String::from_utf16_lossy(&cls[..len]);
 
-            if cls_name == "Chrome_RenderWidgetHostHWND" {
+            if cls_name == "Chrome_RenderWidgetHostHWND" && IsChild(wv, hwnd_under).as_bool() {
                 CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                info!("[is_over_desktop] Chrome_RWHH auto-discovered at 0x{:X}", hwnd_under.0 as isize);
+                info!("[is_over_desktop] OUR Chrome_RWHH confirmed at 0x{:X} (child of wv 0x{:X})",
+                    hwnd_under.0 as isize, wv.0 as isize);
                 return true;
             }
         }
@@ -448,6 +456,17 @@ pub mod mouse_hook {
 
                 let hwnd_under = WindowFromPoint(info_hook.pt);
                 let wv = HWND(wv_raw as *mut _);
+
+                // Smart log: only on boundary crossing
+                static LAST_HWND_UNDER: AtomicIsize = AtomicIsize::new(0);
+                let prev = LAST_HWND_UNDER.swap(hwnd_under.0 as isize, Ordering::Relaxed);
+                if prev != hwnd_under.0 as isize {
+                    let mut cls = [0u16; 64];
+                    let len = GetClassNameW(hwnd_under, &mut cls);
+                    let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+                    let over = is_over_desktop(hwnd_under);
+                    info!("[hook] cursor → 0x{:X} '{}' is_over_desktop={}", hwnd_under.0 as isize, cls_name, over);
+                }
 
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
