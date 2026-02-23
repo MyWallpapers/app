@@ -218,6 +218,12 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             std::mem::size_of::<u32>() as u32,
         );
 
+        // Paint any gap between WebView2 edge and window edge as black.
+        // Without this, the window has no background brush and any
+        // sub-pixel gaps show the Windows wallpaper behind WorkerW.
+        use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
+        SetClassLongPtrW(our_hwnd, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
+
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
