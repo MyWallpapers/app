@@ -205,12 +205,14 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // Z-order: place behind SHELLDLL_DefView (icons), not HWND_BOTTOM.
-        // HWND_BOTTOM is too far back on 24H2 — lands behind the XAML wallpaper.
+        // Z-order is already correct: we're a child of WorkerW (behind
+        // SHELLDLL_DefView in the Progman hierarchy). Use SWP_NOZORDER to
+        // skip invalid cross-parent z-order, which caused SetWindowPos to
+        // silently fail and leave the window at default size.
         let _ = SetWindowPos(
-            our_hwnd, detection.shell_view,
-            detection.v_x, detection.v_y, detection.v_width, detection.v_height,
-            SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            our_hwnd, HWND::default(),
+            0, 0, detection.v_width, detection.v_height,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER,
         );
 
         let _ = ShowWindow(our_hwnd, SW_SHOW);
@@ -267,9 +269,10 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     let (w, h) = (detection.v_width, detection.v_height);
 
+    let our_hwnd_isize = our_hwnd.0 as isize;
     std::thread::spawn(move || {
-        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SetWindowPos, GetWindowRect, SWP_NOZORDER, SWP_SHOWWINDOW};
 
         for attempt in 1..=100 {
             let ptr = wry::get_last_composition_controller_ptr();
@@ -282,6 +285,17 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                         let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB, WPARAM(w as usize), LPARAM(h as isize));
                     }
                     info!("[WRY_POLL] Bounds set to {}x{}", w, h);
+                }
+
+                // Force outer window to full size — Tauri/WebView2 init may have resized it.
+                unsafe {
+                    let wv_h = HWND(our_hwnd_isize as *mut _);
+                    let _ = SetWindowPos(wv_h, HWND::default(), 0, 0, w, h, SWP_NOZORDER | SWP_SHOWWINDOW);
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(wv_h, &mut rect);
+                    info!("[WRY_POLL] Post-resize RECT: ({},{})→({},{}) = {}x{}",
+                        rect.left, rect.top, rect.right, rect.bottom,
+                        rect.right - rect.left, rect.bottom - rect.top);
                 }
                 break;
             }
