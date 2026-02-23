@@ -200,7 +200,23 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
         ex_style &= !WS_EX_LAYERED.0;
         ex_style &= !WS_EX_NOACTIVATE.0;
+        // Remove all border-producing extended styles so no visible
+        // gaps appear between the WebView content and the window edge.
+        ex_style &= !WS_EX_CLIENTEDGE.0;
+        ex_style &= !WS_EX_WINDOWEDGE.0;
+        ex_style &= !WS_EX_DLGMODALFRAME.0;
+        ex_style &= !WS_EX_STATICEDGE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
+
+        // Disable the DWM thin border that Windows 11 adds to borderless windows
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
+        let no_border: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            our_hwnd,
+            DWMWA_BORDER_COLOR,
+            &no_border as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
 
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
