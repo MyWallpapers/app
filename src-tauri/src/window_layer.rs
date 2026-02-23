@@ -354,11 +354,26 @@ pub mod mouse_hook {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
 
-                // Log first 5 events + every 200th to confirm forwarding pipeline
+                let is_click = kind == MOUSE_LDOWN || kind == MOUSE_LUP
+                    || kind == MOUSE_RDOWN || kind == MOUSE_RUP
+                    || kind == MOUSE_MDOWN || kind == MOUSE_MUP;
+
+                // Log first 5 events + every 200th + ALL click events
                 static FWD_N: AtomicIsize = AtomicIsize::new(0);
                 let n = FWD_N.fetch_add(1, Ordering::Relaxed);
-                if n < 5 || n % 200 == 0 {
+                if n < 5 || n % 200 == 0 || is_click {
                     info!("[dispatch] #{} kind=0x{:X} vk={} x={} y={} ptr=0x{:X}", n, kind, vk, x, y, ptr);
+                }
+
+                // For click-down events: ensure focus + send MOUSEMOVE to sync cursor
+                if kind == MOUSE_LDOWN || kind == MOUSE_RDOWN || kind == MOUSE_MDOWN {
+                    // Set focus to WebView host so clicks are processed correctly
+                    let wv_h = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+                    if !wv_h.is_invalid() {
+                        let _ = SetFocus(wv_h);
+                    }
+                    // Force cursor position update before click
+                    let _ = wry::send_mouse_input_raw(ptr, MOUSE_MOVE, vk, 0, x, y);
                 }
 
                 if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
