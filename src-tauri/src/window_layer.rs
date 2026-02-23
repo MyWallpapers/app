@@ -522,30 +522,31 @@ pub mod mouse_hook {
 
     #[inline]
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::core::VARIANT;
-        use windows::Win32::Foundation::POINT;
         use windows::Win32::System::Variant::{VT_DISPATCH, VT_I4};
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+        use windows::Win32::Foundation::HWND;
 
-        let pt = POINT { x, y };
-        let mut p_acc: Option<IAccessible> = None;
-        let mut var_child = VARIANT::default();
+        let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
+        if slv == 0 { return false; }
 
-        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
-            if let Some(acc) = p_acc {
-                match acc.accHitTest(x, y) {
-                    Ok(hit) => {
-                        let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                        if vt == VT_I4.0 as u16 {
-                            hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
-                        } else {
-                            vt == VT_DISPATCH.0 as u16
-                        }
+        // Use OBJID_CLIENT (0xFFFFFFFC) to get the list view's accessible object directly.
+        // This bypasses any floating windows (like Chrome_RenderWidgetHostHWND) that might intercept AccessibleObjectFromPoint.
+        let acc_result: Result<IAccessible, _> = AccessibleObjectFromWindow(HWND(slv as *mut _), 0xFFFFFFFC);
+        if let Ok(acc) = acc_result {
+            match acc.accHitTest(x, y) {
+                Ok(hit) => {
+                    let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                    if vt == VT_I4.0 as u16 {
+                        hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
+                    } else {
+                        vt == VT_DISPATCH.0 as u16
                     }
-                    Err(_) => false,
                 }
-            } else { false }
-        } else { false }
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
     }
 
     #[inline]
@@ -610,7 +611,6 @@ pub mod mouse_hook {
 
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
-                let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
                 let state = HOOK_STATE.load(Ordering::Relaxed);
 
                 if state == STATE_NATIVE {
@@ -641,6 +641,8 @@ pub mod mouse_hook {
                 let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
 
                 if is_down {
+                    // Only perform expensive cross-process accessibility hit-testing on click, not on hover
+                    let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
                     if is_icon && icons_visible {
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
