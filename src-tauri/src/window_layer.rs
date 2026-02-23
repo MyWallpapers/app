@@ -505,19 +505,6 @@ pub mod mouse_hook {
                         CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
                         info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (browser pid={} matches app via process tree)",
                             hwnd_under.0 as isize, browser_pid);
-
-                        // Disable RWHH AND its parent Chrome_WidgetWin_1 so
-                        // WindowFromPoint skips both. Without this, disabling
-                        // only RWHH causes WindowFromPoint to land on Chrome_WidgetWin_1.
-                        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-                        let _ = EnableWindow(hwnd_under, false);
-                        let _ = SetWindowPos(hwnd_under, HWND_BOTTOM, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                        let _ = EnableWindow(direct_parent, false);
-                        let _ = SetWindowPos(direct_parent, HWND_BOTTOM, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                        info!("[is_over_desktop] RWHH + Chrome_WidgetWin_1 disabled + HWND_BOTTOM");
-
                         return true;
                     }
                 }
@@ -592,8 +579,54 @@ pub mod mouse_hook {
                 let _ = ScreenToClient(wv, &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                // Desktop interactions (icons, selection, drag-drop, double-click)
-                // are all handled natively by Windows since RWHH is disabled.
+                // Forward to SysListView32 for icon interactions + selection rectangle
+                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+                let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
+
+                if icons_visible && !slv.is_invalid() {
+                    let lp;
+                    if msg == 0x020A || msg == 0x020E { // WM_MOUSEWHEEL, WM_MOUSEHWHEEL
+                        // Wheel events use screen coordinates in lParam
+                        lp = ((info_hook.pt.x as i16 as u16 as u32) | ((info_hook.pt.y as i16 as u16 as u32) << 16)) as isize;
+                    } else {
+                        let mut slv_cp = info_hook.pt;
+                        let _ = ScreenToClient(slv, &mut slv_cp);
+                        lp = ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16)) as isize;
+                    }
+
+                    let mut out_msg = msg;
+                    if msg == 0x0201 { // WM_LBUTTONDOWN
+                        // Manual double-click detection: low-level hooks only see
+                        // WM_LBUTTONDOWN, never WM_LBUTTONDBLCLK. We must synthesize it.
+                        static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        static LAST_DOWN_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                        static LAST_DOWN_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+                        let now = info_hook.time;
+                        let last_time = LAST_DOWN_TIME.load(Ordering::Relaxed);
+                        let dt = now.saturating_sub(last_time);
+                        let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
+                        let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
+
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+                        let max_time = GetDoubleClickTime();
+                        let max_dx = GetSystemMetrics(SM_CXDOUBLECLK) / 2;
+                        let max_dy = GetSystemMetrics(SM_CYDOUBLECLK) / 2;
+
+                        if dt > 0 && dt <= max_time && dx <= max_dx && dy <= max_dy {
+                            out_msg = 0x0203; // WM_LBUTTONDBLCLK
+                            LAST_DOWN_TIME.store(0, Ordering::Relaxed);
+                        } else {
+                            LAST_DOWN_TIME.store(now, Ordering::Relaxed);
+                            LAST_DOWN_X.store(info_hook.pt.x, Ordering::Relaxed);
+                            LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
+                        }
+                    }
+
+                    let _ = PostMessageW(slv, out_msg, wparam, LPARAM(lp));
+                }
+
+                // Always let OS propagate — needed for DoDragDrop native handling
                 CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
