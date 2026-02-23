@@ -518,32 +518,40 @@ pub mod mouse_hook {
 
     #[inline]
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::core::VARIANT;
-        use windows::Win32::Foundation::POINT;
         use windows::Win32::System::Variant::VT_I4;
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+        use windows::Win32::Foundation::HWND;
+        use windows::core::Interface;
 
-        let pt = POINT { x, y };
-        let mut p_acc: Option<IAccessible> = None;
-        let mut var_child = VARIANT::default();
+        let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
+        if slv == 0 { return false; }
 
-        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
-            if let Some(acc) = p_acc {
-                match acc.accHitTest(x, y) {
-                    Ok(hit) => {
-                        let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                        // Only if strictly an icon (VT_I4 with positive child ID).
-                        // VT_DISPATCH = empty space → return false to handle selection box.
-                        if vt == VT_I4.0 as u16 {
-                            hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
-                        } else {
-                            false
-                        }
-                    }
-                    Err(_) => false,
+        // Query SysListView32 directly via OBJID_CLIENT (0xFFFFFFFC).
+        // This bypasses the floating Chrome_RenderWidgetHostHWND that
+        // intercepts AccessibleObjectFromPoint.
+        let mut p_acc: *mut core::ffi::c_void = core::ptr::null_mut();
+        let hr = AccessibleObjectFromWindow(
+            HWND(slv as *mut _),
+            0xFFFFFFFC,
+            &IAccessible::IID,
+            &mut p_acc,
+        );
+        if hr.is_err() || p_acc.is_null() { return false; }
+        let acc: IAccessible = core::mem::transmute(p_acc);
+
+        match acc.accHitTest(x, y) {
+            Ok(hit) => {
+                let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                // VT_I4 with positive child ID = icon hit.
+                // VT_DISPATCH = empty space → return false for selection box.
+                if vt == VT_I4.0 as u16 {
+                    hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
+                } else {
+                    false
                 }
-            } else { false }
-        } else { false }
+            }
+            Err(_) => false,
+        }
     }
 
     #[inline]
