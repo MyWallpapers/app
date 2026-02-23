@@ -614,15 +614,16 @@ pub mod mouse_hook {
                     info!("[hook] {} 0x{:X} '{}' is_over_desktop={}", tag, hwnd_under.0 as isize, cls_name, over);
                 }
 
-                if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
-
-                let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
+                // STATE_NATIVE first — zero overhead during native icon interactions.
+                // This must come BEFORE is_over_desktop/is_icon to keep the hook
+                // fast enough for double-clicks and drag-and-drop to work.
                 let state = HOOK_STATE.load(Ordering::Relaxed);
-
                 if state == STATE_NATIVE {
                     if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
+
+                if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
                 let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
                 let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
@@ -646,7 +647,9 @@ pub mod mouse_hook {
                     return LRESULT(1);
                 }
 
+                // IDLE: only call expensive COM hit-test on mouse-down, not every move
                 if is_down {
+                    let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
                     if is_icon && icons_visible {
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
