@@ -318,6 +318,57 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                     info!("[WRY_POLL] Post-resize RECT: ({},{})→({},{}) = {}x{}",
                         rect.left, rect.top, rect.right, rect.bottom,
                         rect.right - rect.left, rect.bottom - rect.top);
+
+                    // Diagnostic: enumerate ALL child windows and log their class + RECT
+                    use windows::Win32::Foundation::BOOL;
+                    unsafe extern "system" fn enum_child_diag(child: HWND, _lp: LPARAM) -> BOOL {
+                        let mut cls = [0u16; 128];
+                        let len = GetClassNameW(child, &mut cls) as usize;
+                        let cls_name = String::from_utf16_lossy(&cls[..len]);
+                        let mut wr = RECT::default();
+                        let mut cr = RECT::default();
+                        let _ = GetWindowRect(child, &mut wr);
+                        let _ = windows::Win32::Graphics::Gdi::GetClientRect(child, &mut cr);
+                        let style = GetWindowLongW(child, GWL_STYLE) as u32;
+                        let ex_style = GetWindowLongW(child, GWL_EXSTYLE) as u32;
+                        info!("[WRY_POLL:CHILD] hwnd=0x{:X} class='{}' WindowRect=({},{})→({},{}) [{}x{}] ClientRect=({},{})→({},{}) [{}x{}] style=0x{:08X} ex_style=0x{:08X}",
+                            child.0 as isize, cls_name,
+                            wr.left, wr.top, wr.right, wr.bottom,
+                            wr.right - wr.left, wr.bottom - wr.top,
+                            cr.left, cr.top, cr.right, cr.bottom,
+                            cr.right - cr.left, cr.bottom - cr.top,
+                            style, ex_style);
+                        BOOL(1)
+                    }
+                    let _ = EnumChildWindows(wv_h, Some(enum_child_diag), LPARAM(0));
+
+                    // Also log the main window's client rect vs window rect
+                    let mut main_cr = RECT::default();
+                    let _ = windows::Win32::Graphics::Gdi::GetClientRect(wv_h, &mut main_cr);
+                    info!("[WRY_POLL] Main window ClientRect: ({},{})→({},{}) = {}x{}",
+                        main_cr.left, main_cr.top, main_cr.right, main_cr.bottom,
+                        main_cr.right - main_cr.left, main_cr.bottom - main_cr.top);
+
+                    // Force ALL child windows to fill the parent (0,0,w,h)
+                    // This ensures no Wry/WebView2 child is undersized
+                    struct ResizeData { w: i32, h: i32 }
+                    let rd = ResizeData { w, h };
+                    unsafe extern "system" fn enum_force_resize(child: HWND, lp: LPARAM) -> BOOL {
+                        let d = &*(lp.0 as *const ResizeData);
+                        let _ = SetWindowPos(child, HWND::default(), 0, 0, d.w, d.h,
+                            SWP_NOZORDER | SWP_NOACTIVATE);
+                        BOOL(1)
+                    }
+                    let _ = EnumChildWindows(wv_h, Some(enum_force_resize), LPARAM(&rd as *const _ as isize));
+                    info!("[WRY_POLL] Forced all child windows to {}x{}", w, h);
+
+                    // Re-set WebView2 bounds after child resize
+                    let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB, WPARAM(w as usize), LPARAM(h as isize));
+
+                    // Second diagnostic pass after forced resize
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = EnumChildWindows(wv_h, Some(enum_child_diag), LPARAM(0));
+                    info!("[WRY_POLL] === Second diagnostic pass complete ===");
                 }
                 break;
             }
