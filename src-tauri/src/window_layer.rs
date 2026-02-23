@@ -237,7 +237,12 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    let _ = window.set_ignore_cursor_events(false);
+    // CRITICAL: must be true so OS doesn't deliver native mouse events to
+    // our window.  ALL mouse input goes through the low-level hook →
+    // SendMouseInput pipeline (composition mode).  `false` causes the
+    // WebView2 to receive BOTH native + SendMouseInput, desynchronizing
+    // cursor position and breaking clicks.
+    let _ = window.set_ignore_cursor_events(true);
 
     let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
