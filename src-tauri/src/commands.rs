@@ -1,8 +1,8 @@
 //! Tauri command handlers
 
 use crate::commands_core;
-use tauri::Emitter;
 use log::info;
+use tauri::Emitter;
 
 pub use commands_core::{SystemInfo, UpdateInfo};
 
@@ -15,7 +15,10 @@ pub fn get_system_info() -> SystemInfo {
 // Auto-Update Commands
 // ============================================================================
 
-fn build_updater(app: &tauri::AppHandle, endpoint: Option<String>) -> Result<tauri_plugin_updater::Updater, String> {
+fn build_updater(
+    app: &tauri::AppHandle,
+    endpoint: Option<String>,
+) -> Result<tauri_plugin_updater::Updater, String> {
     use tauri_plugin_updater::UpdaterExt;
     if let Some(url) = endpoint {
         commands_core::validate_updater_endpoint(&url)?;
@@ -26,12 +29,16 @@ fn build_updater(app: &tauri::AppHandle, endpoint: Option<String>) -> Result<tau
             .build()
             .map_err(|e| format!("Build failed: {}", e))
     } else {
-        app.updater().map_err(|e| format!("Updater not available: {}", e))
+        app.updater()
+            .map_err(|e| format!("Updater not available: {}", e))
     }
 }
 
 #[tauri::command]
-pub async fn check_for_updates(app: tauri::AppHandle, endpoint: Option<String>) -> Result<Option<UpdateInfo>, String> {
+pub async fn check_for_updates(
+    app: tauri::AppHandle,
+    endpoint: Option<String>,
+) -> Result<Option<UpdateInfo>, String> {
     let updater = build_updater(&app, endpoint)?;
 
     match updater.check().await {
@@ -50,7 +57,10 @@ pub async fn check_for_updates(app: tauri::AppHandle, endpoint: Option<String>) 
 }
 
 #[tauri::command]
-pub async fn download_and_install_update(app: tauri::AppHandle, endpoint: Option<String>) -> Result<(), String> {
+pub async fn download_and_install_update(
+    app: tauri::AppHandle,
+    endpoint: Option<String>,
+) -> Result<(), String> {
     use tauri::Manager;
 
     let emit_status = |status: &str| {
@@ -61,15 +71,20 @@ pub async fn download_and_install_update(app: tauri::AppHandle, endpoint: Option
 
     emit_status("checking");
     let updater = build_updater(&app, endpoint)?;
-    let update = updater.check().await
+    let update = updater
+        .check()
+        .await
         .map_err(|e| format!("Update check failed: {}", e))?
         .ok_or_else(|| "No update available".to_string())?;
 
     emit_status("downloading");
-    update.download_and_install(
-        |_, _| {},
-        || info!("[updater] Download complete, installing..."),
-    ).await.map_err(|e| format!("Update install failed: {}", e))?;
+    update
+        .download_and_install(
+            |_, _| {},
+            || info!("[updater] Download complete, installing..."),
+        )
+        .await
+        .map_err(|e| format!("Update install failed: {}", e))?;
 
     emit_status("installed");
     Ok(())
@@ -88,14 +103,18 @@ pub fn restart_app(app: tauri::AppHandle) {
 pub async fn open_oauth_in_browser(app: tauri::AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     commands_core::validate_oauth_url(&url)?;
-    app.opener().open_url(&url, None::<&str>).map_err(|e| format!("Failed to open browser: {}", e))
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| format!("Failed to open browser: {}", e))
 }
 
 #[tauri::command]
 pub fn reload_window(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
     if let Some(window) = app.get_webview_window("main") {
-        window.emit("reload-app", ()).map_err(|e| format!("Failed to emit event: {}", e))
+        window
+            .emit("reload-app", ())
+            .map_err(|e| format!("Failed to emit event: {}", e))
     } else {
         Err("Main window not found".into())
     }

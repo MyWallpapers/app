@@ -17,7 +17,10 @@ pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
     {
         info!("[window_layer] Starting desktop window setup phase...");
         if let Err(e) = ensure_in_worker_w(_window) {
-            error!("[window_layer] CRITICAL: Failed to setup desktop layer: {}", e);
+            error!(
+                "[window_layer] CRITICAL: Failed to setup desktop layer: {}",
+                e
+            );
         } else {
             info!("[window_layer] Desktop layer setup completed successfully.");
         }
@@ -41,21 +44,30 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::needless_return)]
 pub fn restore_desktop_icons_and_unhook() {
-    if ICONS_RESTORED.swap(true, Ordering::SeqCst) { return; }
+    if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW, UnhookWindowsHookEx, HHOOK};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            ShowWindow, UnhookWindowsHookEx, HHOOK, SW_SHOW,
+        };
 
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
-            unsafe { let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW); }
+            unsafe {
+                let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW);
+            }
         }
 
         let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
         if hook_ptr != 0 {
-            unsafe { let _ = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)); }
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _));
+            }
         }
     }
 }
@@ -73,8 +85,13 @@ unsafe fn is_class_name(hwnd: windows::Win32::Foundation::HWND, expected: &str) 
     use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
     let mut buf = [0u16; 128];
     let len = GetClassNameW(hwnd, &mut buf) as usize;
-    if len != expected.len() { return false; }
-    expected.encode_utf16().zip(buf[..len].iter()).all(|(a, b)| a == *b)
+    if len != expected.len() {
+        return false;
+    }
+    expected
+        .encode_utf16()
+        .zip(buf[..len].iter())
+        .all(|(a, b)| a == *b)
 }
 
 // ==============================================================================
@@ -106,29 +123,59 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         // Force Windows to spawn the wallpaper WorkerW layer
         let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        let _ = SendMessageTimeoutW(
+            progman,
+            0x052C,
+            WPARAM(0x0D),
+            LPARAM(1),
+            SMTO_NORMAL,
+            1000,
+            Some(&mut msg_result),
+        );
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let mut target_parent = HWND::default();
         let mut shell_for_slv = HWND::default();
 
         // 1. Detection Win11 24H2+: SHELLDLL_DefView is direct child of Progman
-        let shell_view = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+        let shell_view = FindWindowExW(
+            progman,
+            HWND::default(),
+            windows::core::w!("SHELLDLL_DefView"),
+            None,
+        )
+        .unwrap_or_default();
 
         if !shell_view.is_invalid() {
-            target_parent = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or_default();
+            target_parent =
+                FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None)
+                    .unwrap_or_default();
             shell_for_slv = shell_view;
         } else {
             // 2. Fallback Win10/Win11
-            struct SearchData { parent: HWND, sv: HWND }
-            let mut data = SearchData { parent: HWND::default(), sv: HWND::default() };
+            struct SearchData {
+                parent: HWND,
+                sv: HWND,
+            }
+            let mut data = SearchData {
+                parent: HWND::default(),
+                sv: HWND::default(),
+            };
 
             unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-                let sv = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+                let sv = FindWindowExW(
+                    hwnd,
+                    HWND::default(),
+                    windows::core::w!("SHELLDLL_DefView"),
+                    None,
+                )
+                .unwrap_or_default();
                 if !sv.is_invalid() {
                     let d = &mut *(lp.0 as *mut SearchData);
                     d.sv = sv;
-                    d.parent = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
+                    d.parent =
+                        FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None)
+                            .unwrap_or_default();
                     return BOOL(0);
                 }
                 BOOL(1)
@@ -138,7 +185,9 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             shell_for_slv = data.sv;
         }
 
-        if target_parent.is_invalid() { target_parent = progman; }
+        if target_parent.is_invalid() {
+            target_parent = progman;
+        }
 
         let mut syslistview = HWND::default();
         unsafe extern "system" fn find_slv(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -149,25 +198,60 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             BOOL(1)
         }
         if !shell_for_slv.is_invalid() {
-            let _ = EnumChildWindows(shell_for_slv, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+            let _ = EnumChildWindows(
+                shell_for_slv,
+                Some(find_slv),
+                LPARAM(&mut syslistview as *mut _ as isize),
+            );
         }
 
         // Absolute Physical Bounds
-        struct MonitorRects { left: i32, top: i32, right: i32, bottom: i32 }
-        let mut m_rects = MonitorRects { left: i32::MAX, top: i32::MAX, right: i32::MIN, bottom: i32::MIN };
-        unsafe extern "system" fn monitor_enum_cb(_hm: HMONITOR, _hdc: HDC, rect: *mut RECT, lparam: LPARAM) -> BOOL {
+        struct MonitorRects {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        let mut m_rects = MonitorRects {
+            left: i32::MAX,
+            top: i32::MAX,
+            right: i32::MIN,
+            bottom: i32::MIN,
+        };
+        unsafe extern "system" fn monitor_enum_cb(
+            _hm: HMONITOR,
+            _hdc: HDC,
+            rect: *mut RECT,
+            lparam: LPARAM,
+        ) -> BOOL {
             let data = &mut *(lparam.0 as *mut MonitorRects);
-            if rect.read().left < data.left { data.left = rect.read().left; }
-            if rect.read().top < data.top { data.top = rect.read().top; }
-            if rect.read().right > data.right { data.right = rect.read().right; }
-            if rect.read().bottom > data.bottom { data.bottom = rect.read().bottom; }
+            if rect.read().left < data.left {
+                data.left = rect.read().left;
+            }
+            if rect.read().top < data.top {
+                data.top = rect.read().top;
+            }
+            if rect.read().right > data.right {
+                data.right = rect.read().right;
+            }
+            if rect.read().bottom > data.bottom {
+                data.bottom = rect.read().bottom;
+            }
             BOOL(1)
         }
-        let _ = EnumDisplayMonitors(HDC::default(), None, Some(monitor_enum_cb), LPARAM(&mut m_rects as *mut _ as isize));
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(monitor_enum_cb),
+            LPARAM(&mut m_rects as *mut _ as isize),
+        );
 
         let width = m_rects.right - m_rects.left;
         let height = m_rects.bottom - m_rects.top;
-        info!("[detect_desktop] Screen: {}x{}, WorkerW: 0x{:X}, explorer pid={}", width, height, target_parent.0 as isize, explorer_pid);
+        info!(
+            "[detect_desktop] Screen: {}x{}, WorkerW: 0x{:X}, explorer pid={}",
+            width, height, target_parent.0 as isize, explorer_pid
+        );
 
         Ok(DesktopDetection {
             progman,
@@ -193,8 +277,12 @@ const NCCALC_SUBCLASS_ID: usize = 0xDEAD_BEE0;
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn nccalc_subclass_proc(
-    hwnd: windows::Win32::Foundation::HWND, msg: u32, wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM, uid_subclass: usize, _ref_data: usize,
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    uid_subclass: usize,
+    _ref_data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::LRESULT;
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
@@ -216,48 +304,85 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     unsafe {
-        if GetParent(our_hwnd).unwrap_or_default() == detection.target_parent { return; }
+        if GetParent(our_hwnd).unwrap_or_default() == detection.target_parent {
+            return;
+        }
 
         // 1. Strip ALL frame / border styles
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE) as u32;
-        style &= !(WS_THICKFRAME.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MAXIMIZEBOX.0
-            | WS_MINIMIZEBOX.0 | WS_POPUP.0 | WS_BORDER.0 | WS_DLGFRAME.0);
+        style &= !(WS_THICKFRAME.0
+            | WS_CAPTION.0
+            | WS_SYSMENU.0
+            | WS_MAXIMIZEBOX.0
+            | WS_MINIMIZEBOX.0
+            | WS_POPUP.0
+            | WS_BORDER.0
+            | WS_DLGFRAME.0);
         style |= WS_CHILD.0 | WS_VISIBLE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
         let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
-        ex_style &= !(WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0 | WS_EX_CLIENTEDGE.0
-            | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0);
+        ex_style &= !(WS_EX_LAYERED.0
+            | WS_EX_NOACTIVATE.0
+            | WS_EX_CLIENTEDGE.0
+            | WS_EX_WINDOWEDGE.0
+            | WS_EX_DLGMODALFRAME.0
+            | WS_EX_STATICEDGE.0);
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
         // 2. WM_NCCALCSIZE subclass → zero non-client area
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(
-            our_hwnd, Some(nccalc_subclass_proc), NCCALC_SUBCLASS_ID, 0);
+            our_hwnd,
+            Some(nccalc_subclass_proc),
+            NCCALC_SUBCLASS_ID,
+            0,
+        );
 
         // 3. Kill DWM border rendering
         use windows::Win32::Graphics::Dwm::*;
         let color_none: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
         let no_round: i32 = 1; // DWMWCP_DONOTROUND
-        let _ = DwmSetWindowAttribute(our_hwnd, DWMWA_BORDER_COLOR,
-            &color_none as *const _ as *const _, std::mem::size_of::<u32>() as u32);
-        let _ = DwmSetWindowAttribute(our_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-            &no_round as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+        let _ = DwmSetWindowAttribute(
+            our_hwnd,
+            DWMWA_BORDER_COLOR,
+            &color_none as *const _ as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            our_hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &no_round as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
 
         // 4. Black background brush
         use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
-        SetClassLongPtrW(our_hwnd, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
+        SetClassLongPtrW(
+            our_hwnd,
+            GCLP_HBRBACKGROUND,
+            GetStockObject(BLACK_BRUSH).0 as isize,
+        );
 
         // 5. Reparent into WorkerW
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
         // 6. Size to full monitor + force frame recalc
-        let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, detection.v_width, detection.v_height,
-            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            our_hwnd,
+            HWND::default(),
+            0,
+            0,
+            detection.v_width,
+            detection.v_height,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER,
+        );
         let _ = ShowWindow(our_hwnd, SW_SHOW);
 
-        info!("[apply_injection] Done. Parent=0x{:X}, Size={}x{}",
-            detection.target_parent.0 as isize, detection.v_width, detection.v_height);
+        info!(
+            "[apply_injection] Done. Parent=0x{:X}, Size={}x{}",
+            detection.target_parent.0 as isize, detection.v_width, detection.v_height
+        );
     }
 }
 
@@ -301,11 +426,21 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
                 unsafe {
                     let wv_h = HWND(our_hwnd_isize as *mut _);
-                    let _ = SetWindowPos(wv_h, HWND::default(), 0, 0, w, h,
-                        SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+                    let _ = SetWindowPos(
+                        wv_h,
+                        HWND::default(),
+                        0,
+                        0,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                    );
 
                     // Fix all child windows: strip borders, set black brush, force full size
-                    struct FixData { w: i32, h: i32 }
+                    struct FixData {
+                        w: i32,
+                        h: i32,
+                    }
                     let fd = FixData { w, h };
                     unsafe extern "system" fn enum_fix_children(child: HWND, lp: LPARAM) -> BOOL {
                         let d = &*(lp.0 as *const FixData);
@@ -314,23 +449,45 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                         let _ = SetWindowLongW(child, GWL_STYLE, st as i32);
 
                         let mut ex = GetWindowLongW(child, GWL_EXSTYLE) as u32;
-                        ex &= !(WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_STATICEDGE.0 | WS_EX_DLGMODALFRAME.0);
+                        ex &= !(WS_EX_CLIENTEDGE.0
+                            | WS_EX_WINDOWEDGE.0
+                            | WS_EX_STATICEDGE.0
+                            | WS_EX_DLGMODALFRAME.0);
                         let _ = SetWindowLongW(child, GWL_EXSTYLE, ex as i32);
 
                         use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
-                        SetClassLongPtrW(child, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
+                        SetClassLongPtrW(
+                            child,
+                            GCLP_HBRBACKGROUND,
+                            GetStockObject(BLACK_BRUSH).0 as isize,
+                        );
 
-                        let _ = SetWindowPos(child, HWND::default(), 0, 0, d.w, d.h,
-                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                        let _ = SetWindowPos(
+                            child,
+                            HWND::default(),
+                            0,
+                            0,
+                            d.w,
+                            d.h,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                        );
                         BOOL(1)
                     }
-                    let _ = EnumChildWindows(wv_h, Some(enum_fix_children), LPARAM(&fd as *const _ as isize));
+                    let _ = EnumChildWindows(
+                        wv_h,
+                        Some(enum_fix_children),
+                        LPARAM(&fd as *const _ as isize),
+                    );
 
                     // Set WebView2 bounds once after all child fixes
                     let dh = mouse_hook::get_dispatch_hwnd();
                     if dh != 0 {
-                        let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB,
-                            WPARAM(w as usize), LPARAM(h as isize));
+                        let _ = PostMessageW(
+                            HWND(dh as *mut _),
+                            mouse_hook::WM_MWP_SETBOUNDS_PUB,
+                            WPARAM(w as usize),
+                            LPARAM(h as isize),
+                        );
                     }
                 }
                 found = true;
@@ -357,10 +514,19 @@ pub mod mouse_hook {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    const MOUSE_MOVE: i32 = 0x0200; const MOUSE_LDOWN: i32 = 0x0201; const MOUSE_LUP: i32 = 0x0202;
-    const MOUSE_RDOWN: i32 = 0x0204; const MOUSE_RUP: i32 = 0x0205; const MOUSE_MDOWN: i32 = 0x0207;
-    const MOUSE_MUP: i32 = 0x0208; const MOUSE_WHEEL: i32 = 0x020A; const MOUSE_HWHEEL: i32 = 0x020E;
-    const VK_NONE: i32 = 0x0; const VK_LBUTTON: i32 = 0x1; const VK_RBUTTON: i32 = 0x2; const VK_MBUTTON: i32 = 0x10;
+    const MOUSE_MOVE: i32 = 0x0200;
+    const MOUSE_LDOWN: i32 = 0x0201;
+    const MOUSE_LUP: i32 = 0x0202;
+    const MOUSE_RDOWN: i32 = 0x0204;
+    const MOUSE_RUP: i32 = 0x0205;
+    const MOUSE_MDOWN: i32 = 0x0207;
+    const MOUSE_MUP: i32 = 0x0208;
+    const MOUSE_WHEEL: i32 = 0x020A;
+    const MOUSE_HWHEEL: i32 = 0x020E;
+    const VK_NONE: i32 = 0x0;
+    const VK_LBUTTON: i32 = 0x1;
+    const VK_RBUTTON: i32 = 0x2;
+    const VK_MBUTTON: i32 = 0x10;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -381,29 +547,57 @@ pub mod mouse_hook {
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
 
-    pub fn set_webview_hwnd(h: isize) { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_syslistview_hwnd(h: isize) { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_target_parent_hwnd(h: isize) { TARGET_PARENT_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_progman_hwnd(h: isize) { PROGMAN_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_explorer_pid(pid: u32) { EXPLORER_PID.store(pid, Ordering::SeqCst); }
-    pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
-    pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
-    pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
-    pub fn get_dispatch_hwnd() -> isize { DISPATCH_HWND.load(Ordering::SeqCst) }
+    pub fn set_webview_hwnd(h: isize) {
+        WEBVIEW_HWND.store(h, Ordering::SeqCst);
+    }
+    pub fn set_syslistview_hwnd(h: isize) {
+        SYSLISTVIEW_HWND.store(h, Ordering::SeqCst);
+    }
+    pub fn set_target_parent_hwnd(h: isize) {
+        TARGET_PARENT_HWND.store(h, Ordering::SeqCst);
+    }
+    pub fn set_progman_hwnd(h: isize) {
+        PROGMAN_HWND.store(h, Ordering::SeqCst);
+    }
+    pub fn set_explorer_pid(pid: u32) {
+        EXPLORER_PID.store(pid, Ordering::SeqCst);
+    }
+    pub fn get_syslistview_hwnd() -> isize {
+        SYSLISTVIEW_HWND.load(Ordering::SeqCst)
+    }
+    pub fn set_comp_controller_ptr(p: isize) {
+        COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst);
+    }
+    pub fn get_comp_controller_ptr() -> isize {
+        COMP_CONTROLLER_PTR.load(Ordering::SeqCst)
+    }
+    pub fn get_dispatch_hwnd() -> isize {
+        DISPATCH_HWND.load(Ordering::SeqCst)
+    }
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
-        if dh == 0 { return; }
-        let wp = WPARAM((kind as u16 as usize) | ((vk as u16 as usize) << 16) | ((data as usize) << 32));
+        if dh == 0 {
+            return;
+        }
+        let wp =
+            WPARAM((kind as u16 as usize) | ((vk as u16 as usize) << 16) | ((data as usize) << 32));
         let lp = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
         let _ = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp);
     }
 
-    unsafe extern "system" fn dispatch_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe extern "system" fn dispatch_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> LRESULT {
         if msg == WM_MWP_SETBOUNDS_PUB {
             let ptr = get_comp_controller_ptr();
-            if ptr != 0 { let _ = wry::set_controller_bounds_raw(ptr, wp.0 as i32, lp.0 as i32); }
+            if ptr != 0 {
+                let _ = wry::set_controller_bounds_raw(ptr, wp.0 as i32, lp.0 as i32);
+            }
             return LRESULT(0);
         }
         if msg == WM_MWP_MOUSE {
@@ -429,9 +623,26 @@ pub mod mouse_hook {
     pub fn init_dispatch_window() {
         unsafe {
             let cls = windows::core::w!("MWP_MouseDispatch");
-            let wc = WNDCLASSW { lpfnWndProc: Some(dispatch_wnd_proc), lpszClassName: cls, ..Default::default() };
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dispatch_wnd_proc),
+                lpszClassName: cls,
+                ..Default::default()
+            };
             let _ = RegisterClassW(&wc);
-            if let Ok(h) = CreateWindowExW(WINDOW_EX_STYLE(0), cls, windows::core::w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, None, None) {
+            if let Ok(h) = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                cls,
+                windows::core::w!(""),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            ) {
                 DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
             }
         }
@@ -440,12 +651,17 @@ pub mod mouse_hook {
     #[inline]
     unsafe fn get_parent_process_id(pid: u32) -> Option<u32> {
         use windows::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
         };
 
         struct SnapGuard(windows::Win32::Foundation::HANDLE);
         impl Drop for SnapGuard {
-            fn drop(&mut self) { unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); } }
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = windows::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
         }
 
         let snap = SnapGuard(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?);
@@ -458,7 +674,9 @@ pub mod mouse_hook {
                 if entry.th32ProcessID == pid {
                     return Some(entry.th32ParentProcessID);
                 }
-                if Process32NextW(snap.0, &mut entry).is_err() { break; }
+                if Process32NextW(snap.0, &mut entry).is_err() {
+                    break;
+                }
             }
         }
         None
@@ -473,10 +691,18 @@ pub mod mouse_hook {
         let dc = HWND(DESKTOP_CORE_HWND.load(Ordering::Relaxed) as *mut _);
 
         // Fast path: known HWNDs (includes cached desktop CoreWindow)
-        if !rwhh.is_invalid() && hwnd_under == rwhh { return true; }
-        if !dc.is_invalid() && hwnd_under == dc { return true; }
-        if hwnd_under == tp || hwnd_under == wv || hwnd_under == pm { return true; }
-        if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() { return true; }
+        if !rwhh.is_invalid() && hwnd_under == rwhh {
+            return true;
+        }
+        if !dc.is_invalid() && hwnd_under == dc {
+            return true;
+        }
+        if hwnd_under == tp || hwnd_under == wv || hwnd_under == pm {
+            return true;
+        }
+        if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() {
+            return true;
+        }
 
         // Slow path: zero-allocation class name checks
         if super::is_class_name(hwnd_under, "Windows.UI.Core.CoreWindow") {
@@ -492,7 +718,10 @@ pub mod mouse_hook {
         }
 
         // Auto-discover Chrome_RWHH via process tree validation
-        if rwhh.is_invalid() && !wv.is_invalid() && super::is_class_name(hwnd_under, "Chrome_RenderWidgetHostHWND") {
+        if rwhh.is_invalid()
+            && !wv.is_invalid()
+            && super::is_class_name(hwnd_under, "Chrome_RenderWidgetHostHWND")
+        {
             let direct_parent = GetParent(hwnd_under).unwrap_or_default();
             if !direct_parent.is_invalid() {
                 let mut browser_pid: u32 = 0;
@@ -514,16 +743,50 @@ pub mod mouse_hook {
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
-            WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, cx, cy),
-            WM_LBUTTONDOWN => { DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, cx, cy); }
-            WM_LBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_LUP, VK_NONE, 0, cx, cy); }
-            WM_RBUTTONDOWN => { DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, cx, cy); }
-            WM_RBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_RUP, VK_NONE, 0, cx, cy); }
-            WM_MBUTTONDOWN => { DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, cx, cy); }
-            WM_MBUTTONUP => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_MUP, VK_NONE, 0, cx, cy); }
+            WM_MOUSEMOVE => post_mouse(
+                MOUSE_MOVE,
+                DRAG_VK.load(Ordering::Relaxed) as i32,
+                0,
+                cx,
+                cy,
+            ),
+            WM_LBUTTONDOWN => {
+                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, cx, cy);
+            }
+            WM_LBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_LUP, VK_NONE, 0, cx, cy);
+            }
+            WM_RBUTTONDOWN => {
+                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, cx, cy);
+            }
+            WM_RBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_RUP, VK_NONE, 0, cx, cy);
+            }
+            WM_MBUTTONDOWN => {
+                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, cx, cy);
+            }
+            WM_MBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_MUP, VK_NONE, 0, cx, cy);
+            }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                post_mouse(kind, VK_NONE, (info_hook.mouseData >> 16) as i16 as i32 as u32, cx, cy);
+                let kind = if msg == WM_MOUSEWHEEL {
+                    MOUSE_WHEEL
+                } else {
+                    MOUSE_HWHEEL
+                };
+                post_mouse(
+                    kind,
+                    VK_NONE,
+                    (info_hook.mouseData >> 16) as i16 as i32 as u32,
+                    cx,
+                    cy,
+                );
             }
             _ => {}
         }
@@ -542,16 +805,26 @@ pub mod mouse_hook {
                 DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
             }
 
-            unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-                let hook_h = HHOOK(crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _);
+            unsafe extern "system" fn hook_proc(
+                code: i32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                let hook_h = HHOOK(
+                    crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _,
+                );
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
 
-                if code < 0 || wv_raw == 0 { return CallNextHookEx(hook_h, code, wparam, lparam); }
+                if code < 0 || wv_raw == 0 {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
 
                 let info_hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
                 let hwnd_under = WindowFromPoint(info_hook.pt);
 
-                if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
+                if !is_over_desktop(hwnd_under) {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
 
                 let msg = wparam.0 as u32;
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -563,25 +836,36 @@ pub mod mouse_hook {
                 let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
                 if !slv.is_invalid() && IsWindowVisible(slv).as_bool() {
                     let lp = if msg == 0x020A || msg == 0x020E {
-                        ((info_hook.pt.x as i16 as u16 as u32) | ((info_hook.pt.y as i16 as u16 as u32) << 16)) as isize
+                        ((info_hook.pt.x as i16 as u16 as u32)
+                            | ((info_hook.pt.y as i16 as u16 as u32) << 16))
+                            as isize
                     } else {
                         let mut slv_cp = info_hook.pt;
                         let _ = ScreenToClient(slv, &mut slv_cp);
-                        ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16)) as isize
+                        ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16))
+                            as isize
                     };
 
                     let mut out_msg = msg;
-                    if msg == 0x0201 { // WM_LBUTTONDOWN — synthesize double-click
-                        static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        static LAST_DOWN_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-                        static LAST_DOWN_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                    if msg == 0x0201 {
+                        // WM_LBUTTONDOWN — synthesize double-click
+                        static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
+                            std::sync::atomic::AtomicI32::new(0);
+                        static LAST_DOWN_Y: std::sync::atomic::AtomicI32 =
+                            std::sync::atomic::AtomicI32::new(0);
 
                         let now = info_hook.time;
                         let dt = now.saturating_sub(LAST_DOWN_TIME.load(Ordering::Relaxed));
                         let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
                         let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
 
-                        if dt > 0 && dt <= DBLCLICK_TIME.load(Ordering::Relaxed) && dx <= DBLCLICK_CX.load(Ordering::Relaxed) && dy <= DBLCLICK_CY.load(Ordering::Relaxed) {
+                        if dt > 0
+                            && dt <= DBLCLICK_TIME.load(Ordering::Relaxed)
+                            && dx <= DBLCLICK_CX.load(Ordering::Relaxed)
+                            && dy <= DBLCLICK_CY.load(Ordering::Relaxed)
+                        {
                             out_msg = 0x0203; // WM_LBUTTONDBLCLK
                             LAST_DOWN_TIME.store(0, Ordering::Relaxed);
                         } else {

@@ -51,8 +51,7 @@ const ALLOWED_UPDATER_PATH_PREFIX: &str = "/MyWallpapers/app/releases/download/"
 
 /// Validate that an updater endpoint URL points to our GitHub releases.
 pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(endpoint)
-        .map_err(|_| "Invalid endpoint URL".to_string())?;
+    let parsed = url::Url::parse(endpoint).map_err(|_| "Invalid endpoint URL".to_string())?;
     if parsed.scheme() != "https" {
         return Err("Endpoint must use HTTPS".into());
     }
@@ -73,8 +72,7 @@ pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), String> {
 /// - Must be valid HTTPS, or HTTP only for localhost/127.0.0.1
 /// - Blocks private/internal IP ranges (SSRF prevention)
 pub fn validate_oauth_url(url_str: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url_str)
-        .map_err(|_| "Invalid URL".to_string())?;
+    let parsed = url::Url::parse(url_str).map_err(|_| "Invalid URL".to_string())?;
 
     match parsed.scheme() {
         "https" => {}
@@ -108,35 +106,40 @@ mod tests {
     fn test_valid_updater_endpoint() {
         assert!(validate_updater_endpoint(
             "https://github.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_valid_updater_endpoint_dev_tag() {
         assert!(validate_updater_endpoint(
             "https://github.com/MyWallpapers/app/releases/download/v1.0.0-dev/latest.json"
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_updater_rejects_http() {
         assert!(validate_updater_endpoint(
             "http://github.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
     fn test_updater_rejects_wrong_host() {
         assert!(validate_updater_endpoint(
             "https://evil.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
     fn test_updater_rejects_wrong_path() {
         assert!(validate_updater_endpoint(
             "https://github.com/evil/repo/releases/download/v1.0.0/latest.json"
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
@@ -148,7 +151,9 @@ mod tests {
 
     #[test]
     fn test_validate_oauth_url_https() {
-        assert!(validate_oauth_url("https://accounts.google.com/o/oauth2/auth?client_id=123").is_ok());
+        assert!(
+            validate_oauth_url("https://accounts.google.com/o/oauth2/auth?client_id=123").is_ok()
+        );
     }
 
     #[test]
