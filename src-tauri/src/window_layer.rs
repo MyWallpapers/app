@@ -608,6 +608,7 @@ pub mod mouse_hook {
                         let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
                         let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
 
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
                         let max_time = GetDoubleClickTime();
                         let max_dx = GetSystemMetrics(SM_CXDOUBLECLK) / 2;
                         let max_dy = GetSystemMetrics(SM_CYDOUBLECLK) / 2;
