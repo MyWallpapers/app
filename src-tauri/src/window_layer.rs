@@ -293,8 +293,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     let our_hwnd_isize = our_hwnd.0 as isize;
     std::thread::spawn(move || {
-        use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SetWindowPos, GetWindowRect, SWP_NOZORDER, SWP_SHOWWINDOW};
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::*;
 
         for attempt in 1..=100 {
             let ptr = wry::get_last_composition_controller_ptr();
@@ -320,7 +320,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                         rect.right - rect.left, rect.bottom - rect.top);
 
                     // Diagnostic: enumerate ALL child windows and log their class + RECT
-                    use windows::Win32::Foundation::BOOL;
                     unsafe extern "system" fn enum_child_diag(child: HWND, _lp: LPARAM) -> BOOL {
                         let mut cls = [0u16; 128];
                         let len = GetClassNameW(child, &mut cls) as usize;
@@ -328,7 +327,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                         let mut wr = RECT::default();
                         let mut cr = RECT::default();
                         let _ = GetWindowRect(child, &mut wr);
-                        let _ = windows::Win32::Graphics::Gdi::GetClientRect(child, &mut cr);
+                        let _ = GetClientRect(child, &mut cr);
                         let style = GetWindowLongW(child, GWL_STYLE) as u32;
                         let ex_style = GetWindowLongW(child, GWL_EXSTYLE) as u32;
                         info!("[WRY_POLL:CHILD] hwnd=0x{:X} class='{}' WindowRect=({},{})→({},{}) [{}x{}] ClientRect=({},{})→({},{}) [{}x{}] style=0x{:08X} ex_style=0x{:08X}",
@@ -344,7 +343,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
                     // Also log the main window's client rect vs window rect
                     let mut main_cr = RECT::default();
-                    let _ = windows::Win32::Graphics::Gdi::GetClientRect(wv_h, &mut main_cr);
+                    let _ = GetClientRect(wv_h, &mut main_cr);
                     info!("[WRY_POLL] Main window ClientRect: ({},{})→({},{}) = {}x{}",
                         main_cr.left, main_cr.top, main_cr.right, main_cr.bottom,
                         main_cr.right - main_cr.left, main_cr.bottom - main_cr.top);
