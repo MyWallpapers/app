@@ -349,7 +349,23 @@ pub mod mouse_hook {
             let ptr = get_comp_controller_ptr();
             if ptr != 0 {
                 let kind = (wp.0 & 0xFFFF) as i32;
-                let _ = wry::send_mouse_input_raw(ptr, kind, ((wp.0 >> 16) & 0xFFFF) as i32, ((wp.0 >> 32) & 0xFFFFFFFF) as u32, (lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
+                let vk = ((wp.0 >> 16) & 0xFFFF) as i32;
+                let data = ((wp.0 >> 32) & 0xFFFFFFFF) as u32;
+                let x = (lp.0 & 0xFFFF) as i16 as i32;
+                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                // Log first 5 events + every 200th to confirm forwarding pipeline
+                static FWD_N: AtomicIsize = AtomicIsize::new(0);
+                let n = FWD_N.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n % 200 == 0 {
+                    info!("[dispatch] #{} kind=0x{:X} vk={} x={} y={} ptr=0x{:X}", n, kind, vk, x, y, ptr);
+                }
+
+                if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
+                    static ERR_N: AtomicIsize = AtomicIsize::new(0);
+                    let en = ERR_N.fetch_add(1, Ordering::Relaxed);
+                    if en < 5 { error!("[dispatch] SendMouseInput FAILED #{}: {}", en, e); }
+                }
             }
             return LRESULT(0);
         }
