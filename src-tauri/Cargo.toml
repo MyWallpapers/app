@@ -47,6 +47,7 @@ features = [
     "Win32_UI_Input",
     "Win32_Graphics_Dwm",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
 ]
 
 # Direct dependency on wry for WebViewExtWindows + composition_controller access

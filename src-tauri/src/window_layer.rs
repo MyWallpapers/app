@@ -183,6 +183,41 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 // Windows: Injection Execution
 // ==============================================================================
 
+// WM_NCCALCSIZE subclass: forces zero non-client area so the client rect
+// fills the entire window rect.  Without this, DefWindowProc may compute
+// a non-zero non-client inset from residual styles, producing the visible
+// border gaps (top/left/right) reported on Windows 11.
+#[cfg(target_os = "windows")]
+const NCCALC_SUBCLASS_ID: usize = 0xDEAD_BEE0;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nccalc_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    uid_subclass: usize,
+    _ref_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    match msg {
+        WM_NCCALCSIZE => {
+            // Return 0 without touching rgrc[0].  Windows interprets
+            // an untouched rect as "client area = full window rect".
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let _ = windows::Win32::UI::Shell::RemoveWindowSubclass(
+                hwnd, Some(nccalc_subclass_proc), uid_subclass);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &DesktopDetection) {
     use windows::Win32::Foundation::{HWND, RECT};
@@ -192,45 +227,61 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let current_parent = GetParent(our_hwnd).unwrap_or_default();
         if current_parent == detection.target_parent { return; }
 
+        // ── 1. Strip ALL frame / border styles ──────────────────────────
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE) as u32;
-        style &= !(WS_THICKFRAME.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0 | WS_POPUP.0);
+        style &= !(WS_THICKFRAME.0 | WS_CAPTION.0 | WS_SYSMENU.0
+            | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0 | WS_POPUP.0
+            | WS_BORDER.0 | WS_DLGFRAME.0);
         style |= WS_CHILD.0 | WS_VISIBLE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
         let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
         ex_style &= !WS_EX_LAYERED.0;
         ex_style &= !WS_EX_NOACTIVATE.0;
-        // Remove all border-producing extended styles so no visible
-        // gaps appear between the WebView content and the window edge.
         ex_style &= !WS_EX_CLIENTEDGE.0;
         ex_style &= !WS_EX_WINDOWEDGE.0;
         ex_style &= !WS_EX_DLGMODALFRAME.0;
         ex_style &= !WS_EX_STATICEDGE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
-        // Disable the DWM thin border that Windows 11 adds to borderless windows
-        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
-        let no_border: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
-        let _ = DwmSetWindowAttribute(
-            our_hwnd,
-            DWMWA_BORDER_COLOR,
-            &no_border as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u32,
-        );
+        // ── 2. Install WM_NCCALCSIZE subclass → zero non-client area ───
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            our_hwnd, Some(nccalc_subclass_proc), NCCALC_SUBCLASS_ID, 0);
 
-        // Paint any gap between WebView2 edge and window edge as black.
-        // Without this, the window has no background brush and any
-        // sub-pixel gaps show the Windows wallpaper behind WorkerW.
+        // ── 3. Kill DWM border rendering completely ─────────────────────
+        use windows::Win32::Graphics::Dwm::*;
+
+        // 3a. Border color = NONE
+        let color_none: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(our_hwnd, DWMWA_BORDER_COLOR,
+            &color_none as *const _ as *const _, std::mem::size_of::<u32>() as u32);
+
+        // 3b. Disable rounded corners (they imply a visible border)
+        let no_round: i32 = 1; // DWMWCP_DONOTROUND
+        let _ = DwmSetWindowAttribute(our_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+            &no_round as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+
+        // 3c. Zero out DWM frame extension margins
+        let margins = windows::Win32::Graphics::Dwm::MARGINS {
+            cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(our_hwnd, &margins);
+
+        // 3d. Query actual DWM visible border thickness for diagnostics
+        let mut border_px: u32 = 0;
+        let _ = DwmGetWindowAttribute(our_hwnd, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
+            &mut border_px as *mut _ as *mut _, std::mem::size_of::<u32>() as u32);
+        info!("[apply_injection] DWM visible border thickness: {}px", border_px);
+
+        // ── 4. Black background brush on main window ────────────────────
         use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
         SetClassLongPtrW(our_hwnd, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
 
+        // ── 5. Reparent into WorkerW ────────────────────────────────────
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // Z-order is already correct: we're a child of WorkerW (behind
-        // SHELLDLL_DefView in the Progman hierarchy). Use SWP_NOZORDER to
-        // skip invalid cross-parent z-order, which caused SetWindowPos to
-        // silently fail and leave the window at default size.
+        // ── 6. Size to full monitor + force frame recalc ────────────────
         let _ = SetWindowPos(
             our_hwnd, HWND::default(),
             0, 0, detection.v_width, detection.v_height,
@@ -243,17 +294,30 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             detection.target_parent.0 as isize, detection.v_width, detection.v_height,
             detection.v_x, detection.v_y);
 
-        // Verify actual window rects after injection
+        // ── 7. Verify actual rects ──────────────────────────────────────
         let mut parent_rect = RECT::default();
         let mut our_rect = RECT::default();
+        let mut client_rect = RECT::default();
         let _ = GetWindowRect(detection.target_parent, &mut parent_rect);
         let _ = GetWindowRect(our_hwnd, &mut our_rect);
+        let _ = GetClientRect(our_hwnd, &mut client_rect);
         info!("[apply_injection] Parent RECT: ({},{})→({},{}) = {}x{}",
             parent_rect.left, parent_rect.top, parent_rect.right, parent_rect.bottom,
             parent_rect.right - parent_rect.left, parent_rect.bottom - parent_rect.top);
-        info!("[apply_injection] Our RECT: ({},{})→({},{}) = {}x{}",
+        info!("[apply_injection] Our WindowRECT: ({},{})→({},{}) = {}x{}",
             our_rect.left, our_rect.top, our_rect.right, our_rect.bottom,
             our_rect.right - our_rect.left, our_rect.bottom - our_rect.top);
+        info!("[apply_injection] Our ClientRECT: ({},{})→({},{}) = {}x{}",
+            client_rect.left, client_rect.top, client_rect.right, client_rect.bottom,
+            client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
+
+        let w_diff = (our_rect.right - our_rect.left) - (client_rect.right - client_rect.left);
+        let h_diff = (our_rect.bottom - our_rect.top) - (client_rect.bottom - client_rect.top);
+        if w_diff != 0 || h_diff != 0 {
+            info!("[apply_injection] WARNING: WindowRect vs ClientRect mismatch! diff={}x{} — non-client area still present", w_diff, h_diff);
+        } else {
+            info!("[apply_injection] OK: ClientRect == WindowRect (zero non-client area)");
+        }
     }
 }
 
@@ -309,18 +373,75 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                     info!("[WRY_POLL] Bounds set to {}x{}", w, h);
                 }
 
-                // Force outer window to full size — Tauri/WebView2 init may have resized it.
+                // Force outer window to full size + fix all children.
                 unsafe {
                     let wv_h = HWND(our_hwnd_isize as *mut _);
-                    let _ = SetWindowPos(wv_h, HWND::default(), 0, 0, w, h, SWP_NOZORDER | SWP_SHOWWINDOW);
-                    let mut rect = RECT::default();
-                    let _ = GetWindowRect(wv_h, &mut rect);
-                    info!("[WRY_POLL] Post-resize RECT: ({},{})→({},{}) = {}x{}",
-                        rect.left, rect.top, rect.right, rect.bottom,
-                        rect.right - rect.left, rect.bottom - rect.top);
 
-                    // Diagnostic: enumerate ALL child windows and log their class + RECT
-                    unsafe extern "system" fn enum_child_diag(child: HWND, _lp: LPARAM) -> BOOL {
+                    // Re-trigger SWP_FRAMECHANGED so the subclass's WM_NCCALCSIZE
+                    // takes effect after the composition controller is ready.
+                    let _ = SetWindowPos(wv_h, HWND::default(), 0, 0, w, h,
+                        SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+
+                    // Diagnostic + fix: enumerate ALL child windows
+                    struct FixData { w: i32, h: i32 }
+                    let fd = FixData { w, h };
+                    unsafe extern "system" fn enum_fix_children(child: HWND, lp: LPARAM) -> BOOL {
+                        let d = &*(lp.0 as *const FixData);
+                        let mut cls = [0u16; 128];
+                        let len = GetClassNameW(child, &mut cls) as usize;
+                        let cls_name = String::from_utf16_lossy(&cls[..len]);
+
+                        // Log before fix
+                        let mut wr = RECT::default();
+                        let mut cr = RECT::default();
+                        let _ = GetWindowRect(child, &mut wr);
+                        let _ = GetClientRect(child, &mut cr);
+                        info!("[WRY_POLL:CHILD] 0x{:X} '{}' BEFORE: WR=({},{})→({},{}) [{}x{}] CR=[{}x{}]",
+                            child.0 as isize, cls_name,
+                            wr.left, wr.top, wr.right, wr.bottom,
+                            wr.right - wr.left, wr.bottom - wr.top,
+                            cr.right - cr.left, cr.bottom - cr.top);
+
+                        // Strip border styles from child windows too
+                        let mut st = GetWindowLongW(child, GWL_STYLE) as u32;
+                        st &= !(WS_BORDER.0 | WS_THICKFRAME.0 | WS_DLGFRAME.0 | WS_CAPTION.0);
+                        let _ = SetWindowLongW(child, GWL_STYLE, st as i32);
+
+                        let mut ex = GetWindowLongW(child, GWL_EXSTYLE) as u32;
+                        ex &= !(WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0
+                            | WS_EX_STATICEDGE.0 | WS_EX_DLGMODALFRAME.0);
+                        let _ = SetWindowLongW(child, GWL_EXSTYLE, ex as i32);
+
+                        // Set BLACK_BRUSH on child window class (Wry container has null brush)
+                        use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
+                        SetClassLongPtrW(child, GCLP_HBRBACKGROUND,
+                            GetStockObject(BLACK_BRUSH).0 as isize);
+
+                        // Force to full parent size
+                        let _ = SetWindowPos(child, HWND::default(), 0, 0, d.w, d.h,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+                        BOOL(1)
+                    }
+                    let _ = EnumChildWindows(wv_h, Some(enum_fix_children), LPARAM(&fd as *const _ as isize));
+
+                    // Re-set WebView2 bounds after all fixes
+                    let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB,
+                        WPARAM(w as usize), LPARAM(h as isize));
+
+                    // Wait for everything to settle, then log final state
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+
+                    let mut main_wr = RECT::default();
+                    let mut main_cr = RECT::default();
+                    let _ = GetWindowRect(wv_h, &mut main_wr);
+                    let _ = GetClientRect(wv_h, &mut main_cr);
+                    info!("[WRY_POLL] FINAL main: WR=({},{})→({},{}) [{}x{}] CR=[{}x{}]",
+                        main_wr.left, main_wr.top, main_wr.right, main_wr.bottom,
+                        main_wr.right - main_wr.left, main_wr.bottom - main_wr.top,
+                        main_cr.right - main_cr.left, main_cr.bottom - main_cr.top);
+
+                    unsafe extern "system" fn enum_final_diag(child: HWND, _lp: LPARAM) -> BOOL {
                         let mut cls = [0u16; 128];
                         let len = GetClassNameW(child, &mut cls) as usize;
                         let cls_name = String::from_utf16_lossy(&cls[..len]);
@@ -328,46 +449,15 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                         let mut cr = RECT::default();
                         let _ = GetWindowRect(child, &mut wr);
                         let _ = GetClientRect(child, &mut cr);
-                        let style = GetWindowLongW(child, GWL_STYLE) as u32;
-                        let ex_style = GetWindowLongW(child, GWL_EXSTYLE) as u32;
-                        info!("[WRY_POLL:CHILD] hwnd=0x{:X} class='{}' WindowRect=({},{})→({},{}) [{}x{}] ClientRect=({},{})→({},{}) [{}x{}] style=0x{:08X} ex_style=0x{:08X}",
+                        info!("[WRY_POLL:CHILD] 0x{:X} '{}' AFTER: WR=({},{})→({},{}) [{}x{}] CR=[{}x{}]",
                             child.0 as isize, cls_name,
                             wr.left, wr.top, wr.right, wr.bottom,
                             wr.right - wr.left, wr.bottom - wr.top,
-                            cr.left, cr.top, cr.right, cr.bottom,
-                            cr.right - cr.left, cr.bottom - cr.top,
-                            style, ex_style);
+                            cr.right - cr.left, cr.bottom - cr.top);
                         BOOL(1)
                     }
-                    let _ = EnumChildWindows(wv_h, Some(enum_child_diag), LPARAM(0));
-
-                    // Also log the main window's client rect vs window rect
-                    let mut main_cr = RECT::default();
-                    let _ = GetClientRect(wv_h, &mut main_cr);
-                    info!("[WRY_POLL] Main window ClientRect: ({},{})→({},{}) = {}x{}",
-                        main_cr.left, main_cr.top, main_cr.right, main_cr.bottom,
-                        main_cr.right - main_cr.left, main_cr.bottom - main_cr.top);
-
-                    // Force ALL child windows to fill the parent (0,0,w,h)
-                    // This ensures no Wry/WebView2 child is undersized
-                    struct ResizeData { w: i32, h: i32 }
-                    let rd = ResizeData { w, h };
-                    unsafe extern "system" fn enum_force_resize(child: HWND, lp: LPARAM) -> BOOL {
-                        let d = &*(lp.0 as *const ResizeData);
-                        let _ = SetWindowPos(child, HWND::default(), 0, 0, d.w, d.h,
-                            SWP_NOZORDER | SWP_NOACTIVATE);
-                        BOOL(1)
-                    }
-                    let _ = EnumChildWindows(wv_h, Some(enum_force_resize), LPARAM(&rd as *const _ as isize));
-                    info!("[WRY_POLL] Forced all child windows to {}x{}", w, h);
-
-                    // Re-set WebView2 bounds after child resize
-                    let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB, WPARAM(w as usize), LPARAM(h as isize));
-
-                    // Second diagnostic pass after forced resize
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    let _ = EnumChildWindows(wv_h, Some(enum_child_diag), LPARAM(0));
-                    info!("[WRY_POLL] === Second diagnostic pass complete ===");
+                    let _ = EnumChildWindows(wv_h, Some(enum_final_diag), LPARAM(0));
+                    info!("[WRY_POLL] === All fixes applied ===");
                 }
                 break;
             }
