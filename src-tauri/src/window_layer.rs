@@ -1,7 +1,7 @@
 //! Window Layer — Desktop WebView injection + mouse forwarding (Windows only).
 
 #[cfg(target_os = "windows")]
-use log::{error, info, debug};
+use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
@@ -25,7 +25,8 @@ pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
+#[allow(unused_variables)]
+pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
@@ -33,9 +34,8 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
-                let _ = ShowWindow(HWND(slv as *mut _), if _visible { SW_SHOW } else { SW_HIDE });
+                let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE });
             }
-            debug!("[window_layer] Desktop icons visibility set to {}", _visible);
         }
     }
     Ok(())
@@ -110,12 +110,14 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let mut target_parent = HWND::default();
+        let mut shell_for_slv = HWND::default();
 
         // 1. Detection Win11 24H2+: SHELLDLL_DefView is direct child of Progman
         let shell_view = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
 
         if !shell_view.is_invalid() {
             target_parent = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or_default();
+            shell_for_slv = shell_view;
         } else {
             // 2. Fallback Win10/Win11
             struct SearchData { parent: HWND, sv: HWND }
@@ -133,6 +135,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             let _ = EnumWindows(Some(enum_cb), LPARAM(&mut data as *mut _ as isize));
             target_parent = data.parent;
+            shell_for_slv = data.sv;
         }
 
         if target_parent.is_invalid() { target_parent = progman; }
@@ -145,11 +148,13 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             BOOL(1)
         }
-        let _ = EnumChildWindows(shell_view, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+        if !shell_for_slv.is_invalid() {
+            let _ = EnumChildWindows(shell_for_slv, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+        }
 
         // Absolute Physical Bounds
         struct MonitorRects { left: i32, top: i32, right: i32, bottom: i32 }
-        let mut m_rects = MonitorRects { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut m_rects = MonitorRects { left: i32::MAX, top: i32::MAX, right: i32::MIN, bottom: i32::MIN };
         unsafe extern "system" fn monitor_enum_cb(_hm: HMONITOR, _hdc: HDC, rect: *mut RECT, lparam: LPARAM) -> BOOL {
             let data = &mut *(lparam.0 as *mut MonitorRects);
             if rect.read().left < data.left { data.left = rect.read().left; }
@@ -430,23 +435,25 @@ pub mod mouse_hook {
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
         };
-        use windows::Win32::Foundation::CloseHandle;
 
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        struct SnapGuard(windows::Win32::Foundation::HANDLE);
+        impl Drop for SnapGuard {
+            fn drop(&mut self) { unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); } }
+        }
+
+        let snap = SnapGuard(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?);
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        if Process32FirstW(snap, &mut entry).is_ok() {
+        if Process32FirstW(snap.0, &mut entry).is_ok() {
             loop {
                 if entry.th32ProcessID == pid {
-                    let _ = CloseHandle(snap);
                     return Some(entry.th32ParentProcessID);
                 }
-                if Process32NextW(snap, &mut entry).is_err() { break; }
+                if Process32NextW(snap.0, &mut entry).is_err() { break; }
             }
         }
-        let _ = CloseHandle(snap);
         None
     }
 
