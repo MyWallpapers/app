@@ -243,10 +243,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    // false is safe: our window sits behind SHELLDLL_DefView in Z-order,
-    // so the OS won't deliver native mouse events to it anyway.
-    // All mouse input comes through the low-level hook → SendMouseInput.
-    let _ = window.set_ignore_cursor_events(false);
+    // TRUE is required! We want the OS to completely ignore our Tauri window
+    // for native mouse clicks so the desktop (SysListView32) gets them natively.
+    // All mouse input to the wallpaper comes through our low-level hook manually.
+    let _ = window.set_ignore_cursor_events(true);
 
     let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
@@ -505,6 +505,15 @@ pub mod mouse_hook {
                         CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
                         info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (browser pid={} matches app via process tree)",
                             hwnd_under.0 as isize, browser_pid);
+
+                        // MAGIC FIX: Make the floating WebView window natively "Click-Through"
+                        // This ensures Windows hit-testing falls through to the desktop icons!
+                        let ex_style = GetWindowLongW(hwnd_under, GWL_EXSTYLE) as u32;
+                        if (ex_style & WS_EX_TRANSPARENT.0) == 0 {
+                            let _ = SetWindowLongW(hwnd_under, GWL_EXSTYLE, (ex_style | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as i32);
+                            info!("[is_over_desktop] Made Chrome_RWHH natively click-through!");
+                        }
+
                         return true;
                     }
                 }
