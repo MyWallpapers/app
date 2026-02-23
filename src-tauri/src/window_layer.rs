@@ -315,9 +315,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use log::{error, info};
-    use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     const MOUSE_MOVE: i32 = 0x0200; const MOUSE_LDOWN: i32 = 0x0201; const MOUSE_LUP: i32 = 0x0202;
@@ -335,9 +334,6 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
-
-    const STATE_IDLE: u8 = 0; const STATE_DRAGGING: u8 = 1; const STATE_NATIVE: u8 = 2;
-    static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -387,13 +383,10 @@ pub mod mouse_hook {
                     info!("[dispatch] #{} kind=0x{:X} vk={} x={} y={} ptr=0x{:X}", n, kind, vk, x, y, ptr);
                 }
 
-                // For click-down events: ensure focus + send MOUSEMOVE to sync cursor
+                // For click-down events: send MOUSEMOVE to sync cursor
                 if kind == MOUSE_LDOWN || kind == MOUSE_RDOWN || kind == MOUSE_MDOWN {
-                    // Set focus to WebView host so clicks are processed correctly
-                    let wv_h = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-                    if !wv_h.is_invalid() {
-                        let _ = SetFocus(wv_h);
-                    }
+                    // We intentionally DO NOT call SetFocus(wv_h) here.
+                    // Stealing focus from the desktop breaks native icon interactions (rename, drag, etc).
                     // Force cursor position update before click
                     let _ = wry::send_mouse_input_raw(ptr, MOUSE_MOVE, vk, 0, x, y);
                 }
@@ -521,41 +514,6 @@ pub mod mouse_hook {
     }
 
     #[inline]
-    unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::Win32::System::Variant::{VT_DISPATCH, VT_I4};
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
-        use windows::Win32::Foundation::HWND;
-        use windows::core::Interface;
-
-        let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-        if slv == 0 { return false; }
-
-        // Use OBJID_CLIENT (0xFFFFFFFC) to get the list view's accessible object directly.
-        // This bypasses any floating windows (like Chrome_RenderWidgetHostHWND) that might intercept AccessibleObjectFromPoint.
-        let mut p_acc: *mut core::ffi::c_void = core::ptr::null_mut();
-        let hr = AccessibleObjectFromWindow(
-            HWND(slv as *mut _),
-            0xFFFFFFFC,
-            &IAccessible::IID,
-            &mut p_acc,
-        );
-        if hr.is_err() || p_acc.is_null() { return false; }
-        let acc: IAccessible = core::mem::transmute(p_acc);
-
-        match acc.accHitTest(x, y) {
-            Ok(hit) => {
-                let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                if vt == VT_I4.0 as u16 {
-                    hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
-                } else {
-                    vt == VT_DISPATCH.0 as u16
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
-    #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
             WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, cx, cy),
@@ -617,52 +575,18 @@ pub mod mouse_hook {
 
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
-                let state = HOOK_STATE.load(Ordering::Relaxed);
-
-                if state == STATE_NATIVE {
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
-
-                // In composition mode, WebView2 receives ALL input exclusively
-                // through SendMouseInput (Wry). Native OS message delivery does
-                // NOT work for composition-hosted WebView2. So we forward
-                // everything via Wry and swallow everything with LRESULT(1).
-                // The cursor still moves on screen (driver updates position
-                // BEFORE the hook runs).
-
-                if state == STATE_DRAGGING {
-                    use windows::Win32::Graphics::Gdi::ScreenToClient;
-                    let mut cp = info_hook.pt;
-                    let _ = ScreenToClient(wv, &mut cp);
-                    forward(msg, &info_hook, cp.x, cp.y);
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    // Let WM_MOUSEMOVE through so OS updates cursor + Chromium hover works
-                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
-                    return LRESULT(1);
-                }
-
-                // IDLE state: decide whether to pass to OS (icon click) or Wry (webview)
-                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-                let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
-
-                if is_down {
-                    // Only perform expensive cross-process accessibility hit-testing on click, not on hover
-                    let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
-                    if is_icon && icons_visible {
-                        HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
-                    }
-                    HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
-                }
-
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
+
+                // Forward the event to Wry so the WebView wallpaper reacts (e.g., hover effects, ripples).
                 forward(msg, &info_hook, cp.x, cp.y);
-                // Let WM_MOUSEMOVE through so OS updates cursor + Chromium hover works
-                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
-                LRESULT(1)
+
+                // ALWAYS pass the event to the OS natively!
+                // This is crucial for native desktop interactions (selection boxes, dragging icons, context menus).
+                // Since WebView2 in Composition Mode ignores native HWND inputs anyway,
+                // there is absolutely no double-click conflict when WindowFromPoint hits the WebView surface.
+                CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
             unsafe {
