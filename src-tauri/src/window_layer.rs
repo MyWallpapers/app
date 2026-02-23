@@ -430,23 +430,22 @@ pub mod mouse_hook {
         };
         use windows::Win32::Foundation::CloseHandle;
 
-        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            if !snap.is_invalid() {
-                let mut entry = PROCESSENTRY32W {
-                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-                    ..Default::default()
-                };
-                if Process32FirstW(snap, &mut entry).is_ok() {
-                    loop {
-                        if entry.th32ProcessID == pid {
-                            let _ = CloseHandle(snap);
-                            return Some(entry.th32ParentProcessID);
-                        }
-                        if Process32NextW(snap, &mut entry).is_err() { break; }
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if let Ok(snap) = snap {
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    if entry.th32ProcessID == pid {
+                        let _ = CloseHandle(snap);
+                        return Some(entry.th32ParentProcessID);
                     }
+                    if Process32NextW(snap, &mut entry).is_err() { break; }
                 }
-                let _ = CloseHandle(snap);
             }
+            let _ = CloseHandle(snap);
         }
         None
     }
