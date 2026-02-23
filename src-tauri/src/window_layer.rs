@@ -261,13 +261,7 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let _ = DwmSetWindowAttribute(our_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
             &no_round as *const _ as *const _, std::mem::size_of::<i32>() as u32);
 
-        // 3c. Zero out DWM frame extension margins
-        let margins = windows::Win32::Graphics::Dwm::MARGINS {
-            cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 0,
-        };
-        let _ = DwmExtendFrameIntoClientArea(our_hwnd, &margins);
-
-        // 3d. Query actual DWM visible border thickness for diagnostics
+        // 3c. Query actual DWM visible border thickness for diagnostics
         let mut border_px: u32 = 0;
         let _ = DwmGetWindowAttribute(our_hwnd, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
             &mut border_px as *mut _ as *mut _, std::mem::size_of::<u32>() as u32);
