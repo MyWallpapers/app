@@ -71,6 +71,7 @@ struct DesktopDetection {
     progman: windows::Win32::Foundation::HWND,
     explorer_pid: u32,
     target_parent: windows::Win32::Foundation::HWND,
+    shell_view: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
     v_x: i32,
     v_y: i32,
@@ -168,6 +169,7 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             progman,
             explorer_pid,
             target_parent,
+            shell_view,
             syslistview,
             v_x: m_rects.left,
             v_y: m_rects.top,
@@ -203,8 +205,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let _ = ShowWindow(detection.target_parent, SW_SHOW);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
+        // Z-order: place behind SHELLDLL_DefView (icons), not HWND_BOTTOM.
+        // HWND_BOTTOM is too far back on 24H2 — lands behind the XAML wallpaper.
         let _ = SetWindowPos(
-            our_hwnd, HWND_BOTTOM,
+            our_hwnd, detection.shell_view,
             detection.v_x, detection.v_y, detection.v_width, detection.v_height,
             SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         );
@@ -237,12 +241,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    // CRITICAL: must be true so OS doesn't deliver native mouse events to
-    // our window.  ALL mouse input goes through the low-level hook →
-    // SendMouseInput pipeline (composition mode).  `false` causes the
-    // WebView2 to receive BOTH native + SendMouseInput, desynchronizing
-    // cursor position and breaking clicks.
-    let _ = window.set_ignore_cursor_events(true);
+    // false is safe: our window sits behind SHELLDLL_DefView in Z-order,
+    // so the OS won't deliver native mouse events to it anyway.
+    // All mouse input comes through the low-level hook → SendMouseInput.
+    let _ = window.set_ignore_cursor_events(false);
 
     let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
@@ -443,13 +445,20 @@ pub mod mouse_hook {
             }
         }
 
-        // Auto-discover Chrome_RWHH — ONLY if it's a child of OUR WebView.
+        // Auto-discover Chrome_RWHH — use PID check (not IsChild, which fails
+        // in composition mode because Chromium detaches RWHH from the window tree).
         if rwhh.is_invalid() && !wv.is_invalid() {
-            if cls_name == "Chrome_RenderWidgetHostHWND" && IsChild(wv, hwnd_under).as_bool() {
-                CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                info!("[is_over_desktop] OUR Chrome_RWHH confirmed at 0x{:X} (child of wv 0x{:X})",
-                    hwnd_under.0 as isize, wv.0 as isize);
-                return true;
+            if cls_name == "Chrome_RenderWidgetHostHWND" {
+                let mut rwhh_pid: u32 = 0;
+                let mut wv_pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd_under, Some(&mut rwhh_pid));
+                GetWindowThreadProcessId(wv, Some(&mut wv_pid));
+                if rwhh_pid == wv_pid {
+                    CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                    info!("[is_over_desktop] OUR Chrome_RWHH confirmed at 0x{:X} (same pid={} as wv)",
+                        hwnd_under.0 as isize, wv_pid);
+                    return true;
+                }
             }
         }
         false
@@ -566,6 +575,8 @@ pub mod mouse_hook {
                     let _ = ScreenToClient(wv, &mut cp);
                     forward(msg, &info_hook, cp.x, cp.y);
                     if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                    // Let WM_MOUSEMOVE through so OS updates cursor + Chromium hover works
+                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                     return LRESULT(1);
                 }
 
@@ -585,6 +596,8 @@ pub mod mouse_hook {
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
+                // Let WM_MOUSEMOVE through so OS updates cursor + Chromium hover works
+                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
                 LRESULT(1)
             }
 
