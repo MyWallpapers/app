@@ -525,27 +525,33 @@ pub mod mouse_hook {
         use windows::Win32::System::Variant::{VT_DISPATCH, VT_I4};
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
         use windows::Win32::Foundation::HWND;
+        use windows::core::Interface;
 
         let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
         if slv == 0 { return false; }
 
         // Use OBJID_CLIENT (0xFFFFFFFC) to get the list view's accessible object directly.
         // This bypasses any floating windows (like Chrome_RenderWidgetHostHWND) that might intercept AccessibleObjectFromPoint.
-        let acc_result: Result<IAccessible, _> = AccessibleObjectFromWindow(HWND(slv as *mut _), 0xFFFFFFFC);
-        if let Ok(acc) = acc_result {
-            match acc.accHitTest(x, y) {
-                Ok(hit) => {
-                    let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                    if vt == VT_I4.0 as u16 {
-                        hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
-                    } else {
-                        vt == VT_DISPATCH.0 as u16
-                    }
+        let mut p_acc: *mut core::ffi::c_void = core::ptr::null_mut();
+        let hr = AccessibleObjectFromWindow(
+            HWND(slv as *mut _),
+            0xFFFFFFFC,
+            &IAccessible::IID,
+            &mut p_acc,
+        );
+        if hr.is_err() || p_acc.is_null() { return false; }
+        let acc: IAccessible = core::mem::transmute(p_acc);
+
+        match acc.accHitTest(x, y) {
+            Ok(hit) => {
+                let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                if vt == VT_I4.0 as u16 {
+                    hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
+                } else {
+                    vt == VT_DISPATCH.0 as u16
                 }
-                Err(_) => false,
             }
-        } else {
-            false
+            Err(_) => false,
         }
     }
 
