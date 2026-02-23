@@ -509,7 +509,7 @@ pub mod mouse_hook {
                         // Disable the RWHH so WindowFromPoint skips it entirely.
                         // Clicks will natively fall through to SysListView32.
                         // Push it to z-bottom so it never intercepts hit-testing.
-                        use windows::Win32::UI::WindowsAndMessaging::{EnableWindow, SetWindowPos, HWND_BOTTOM, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE};
+                        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
                         let _ = EnableWindow(hwnd_under, false);
                         let _ = SetWindowPos(hwnd_under, HWND_BOTTOM, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
