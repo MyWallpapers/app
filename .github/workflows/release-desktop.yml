@@ -21,6 +21,30 @@ on:
           - dev
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Check formatting
+        run: cd src-tauri && cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cd src-tauri && cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cd src-tauri && cargo test --all
+
   bump-version:
     runs-on: ubuntu-latest
     permissions:
@@ -66,7 +90,7 @@ jobs:
           git push origin main "${{ steps.bump.outputs.tag }}"
 
   build-tauri:
-    needs: bump-version
+    needs: [validate, bump-version]
     permissions:
       contents: write
     strategy:

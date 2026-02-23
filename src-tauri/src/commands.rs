@@ -18,6 +18,7 @@ pub fn get_system_info() -> SystemInfo {
 fn build_updater(app: &tauri::AppHandle, endpoint: Option<String>) -> Result<tauri_plugin_updater::Updater, String> {
     use tauri_plugin_updater::UpdaterExt;
     if let Some(url) = endpoint {
+        commands_core::validate_updater_endpoint(&url)?;
         let parsed: url::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
         app.updater_builder()
             .endpoints(vec![parsed])

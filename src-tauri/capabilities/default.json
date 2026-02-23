@@ -8,13 +8,13 @@
   "remote": {
     "urls": [
       "https://dev.mywallpaper.online/*",
-      "https://*.mywallpaper.online/*"
+      "https://app.mywallpaper.online/*",
+      "https://api.mywallpaper.online/*"
     ]
   },
   "permissions": [
     "core:default",
     "core:event:default",
-    "process:default",
     "autostart:default",
     "updater:default",
     "opener:default",

@@ -293,14 +293,11 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::*;
 
+        let mut found = false;
         for _ in 1..=100 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
                 mouse_hook::set_comp_controller_ptr(ptr);
-                let dh = mouse_hook::get_dispatch_hwnd();
-                if dh != 0 {
-                    unsafe { let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB, WPARAM(w as usize), LPARAM(h as isize)); }
-                }
 
                 unsafe {
                     let wv_h = HWND(our_hwnd_isize as *mut _);
@@ -329,15 +326,20 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                     }
                     let _ = EnumChildWindows(wv_h, Some(enum_fix_children), LPARAM(&fd as *const _ as isize));
 
-                    // Re-set WebView2 bounds after all child fixes
+                    // Set WebView2 bounds once after all child fixes
+                    let dh = mouse_hook::get_dispatch_hwnd();
                     if dh != 0 {
                         let _ = PostMessageW(HWND(dh as *mut _), mouse_hook::WM_MWP_SETBOUNDS_PUB,
                             WPARAM(w as usize), LPARAM(h as isize));
                     }
                 }
+                found = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !found {
+            error!("[window_layer] Timed out waiting for composition controller (1s)");
         }
     });
 
@@ -370,6 +372,11 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
+
+    // Cached system metrics for double-click detection (avoid Win32 calls in hook hot path)
+    static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
+    static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -527,6 +534,12 @@ pub mod mouse_hook {
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+                // Cache double-click metrics once at hook startup
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+                DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
+                DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
+                DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
             }
 
             unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -568,8 +581,7 @@ pub mod mouse_hook {
                         let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
                         let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
 
-                        use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-                        if dt > 0 && dt <= GetDoubleClickTime() && dx <= GetSystemMetrics(SM_CXDOUBLECLK)/2 && dy <= GetSystemMetrics(SM_CYDOUBLECLK)/2 {
+                        if dt > 0 && dt <= DBLCLICK_TIME.load(Ordering::Relaxed) && dx <= DBLCLICK_CX.load(Ordering::Relaxed) && dy <= DBLCLICK_CY.load(Ordering::Relaxed) {
                             out_msg = 0x0203; // WM_LBUTTONDBLCLK
                             LAST_DOWN_TIME.store(0, Ordering::Relaxed);
                         } else {
