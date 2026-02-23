@@ -460,50 +460,24 @@ pub mod mouse_hook {
             }
         }
 
-        // Auto-discover Chrome_RWHH — walk parent chain to see if it leads to
-        // our WebView, WorkerW, or Progman. PID and IsChild both fail because
-        // WebView2 renderer runs in a separate process and RWHH may be detached
-        // in composition mode. Chrome/Edge RWHH has Chrome_WidgetWin_1 as parent.
+        // Auto-discover Chrome_RWHH — check if the PARENT's PID matches our app.
+        // RWHH itself is in the renderer process (different PID), but its parent
+        // Chrome_WidgetWin_1 is in the browser process. For OUR WebView2, that
+        // browser process IS our app. For the user's Chrome, it's Chrome.exe.
         if rwhh.is_invalid() && !wv.is_invalid() {
             if cls_name == "Chrome_RenderWidgetHostHWND" {
-                let mut h = hwnd_under;
-                let mut ours = false;
-                for _ in 0..8 {
-                    h = GetParent(h).unwrap_or_default();
-                    if h.is_invalid() { break; }
-                    if h == wv || h == tp || h == pm {
-                        ours = true;
-                        break;
-                    }
-                }
-                if ours {
-                    CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                    info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (ancestor=0x{:X})",
-                        hwnd_under.0 as isize, h.0 as isize);
-                    return true;
-                }
-                // Parent chain didn't match — check if parent is NOT a Chromium
-                // top-level window (Chrome_WidgetWin_*). If it isn't, this RWHH
-                // likely belongs to our injected WebView2.
                 let direct_parent = GetParent(hwnd_under).unwrap_or_default();
                 if !direct_parent.is_invalid() {
-                    let mut p_cls = [0u16; 64];
-                    let p_len = GetClassNameW(direct_parent, &mut p_cls) as usize;
-                    let p_name = String::from_utf16_lossy(&p_cls[..p_len]);
-                    if !p_name.starts_with("Chrome_WidgetWin") {
+                    let mut parent_pid: u32 = 0;
+                    let mut wv_pid: u32 = 0;
+                    GetWindowThreadProcessId(direct_parent, Some(&mut parent_pid));
+                    GetWindowThreadProcessId(wv, Some(&mut wv_pid));
+                    if parent_pid == wv_pid {
                         CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                        info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (parent=0x{:X} '{}')",
-                            hwnd_under.0 as isize, direct_parent.0 as isize, p_name);
+                        info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (parent pid={} matches app)",
+                            hwnd_under.0 as isize, parent_pid);
                         return true;
                     }
-                    info!("[is_over_desktop] RWHH 0x{:X} is NOT ours (parent='{}' 0x{:X})",
-                        hwnd_under.0 as isize, p_name, direct_parent.0 as isize);
-                } else {
-                    // No parent at all — orphan RWHH, assume ours (desktop injection)
-                    CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                    info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (orphan, no parent)",
-                        hwnd_under.0 as isize);
-                    return true;
                 }
             }
         }
