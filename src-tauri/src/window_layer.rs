@@ -243,10 +243,10 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    // TRUE is required! We want the OS to completely ignore our Tauri window
-    // for native mouse clicks so the desktop (SysListView32) gets them natively.
-    // All mouse input to the wallpaper comes through our low-level hook manually.
-    let _ = window.set_ignore_cursor_events(true);
+    // false is safe: our window sits behind SHELLDLL_DefView in Z-order,
+    // so the OS won't deliver native mouse events to it anyway.
+    // All mouse input comes through the low-level hook → SendMouseInput.
+    let _ = window.set_ignore_cursor_events(false);
 
     let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
@@ -315,7 +315,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use log::{error, info};
-    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -334,6 +334,9 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
+
+    const STATE_IDLE: u8 = 0; const STATE_DRAGGING: u8 = 1; const STATE_NATIVE: u8 = 2;
+    static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -505,21 +508,42 @@ pub mod mouse_hook {
                         CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
                         info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (browser pid={} matches app via process tree)",
                             hwnd_under.0 as isize, browser_pid);
-
-                        // MAGIC FIX: Make the floating WebView window natively "Click-Through"
-                        // This ensures Windows hit-testing falls through to the desktop icons!
-                        let ex_style = GetWindowLongW(hwnd_under, GWL_EXSTYLE) as u32;
-                        if (ex_style & WS_EX_TRANSPARENT.0) == 0 {
-                            let _ = SetWindowLongW(hwnd_under, GWL_EXSTYLE, (ex_style | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as i32);
-                            info!("[is_over_desktop] Made Chrome_RWHH natively click-through!");
-                        }
-
                         return true;
                     }
                 }
             }
         }
         false
+    }
+
+    #[inline]
+    unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
+        use windows::core::VARIANT;
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::System::Variant::VT_I4;
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+
+        let pt = POINT { x, y };
+        let mut p_acc: Option<IAccessible> = None;
+        let mut var_child = VARIANT::default();
+
+        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
+            if let Some(acc) = p_acc {
+                match acc.accHitTest(x, y) {
+                    Ok(hit) => {
+                        let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                        // Only if strictly an icon (VT_I4 with positive child ID).
+                        // VT_DISPATCH = empty space → return false to handle selection box.
+                        if vt == VT_I4.0 as u16 {
+                            hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                }
+            } else { false }
+        } else { false }
     }
 
     #[inline]
@@ -584,18 +608,59 @@ pub mod mouse_hook {
 
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
+                let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
+                let state = HOOK_STATE.load(Ordering::Relaxed);
+
+                if state == STATE_NATIVE {
+                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+                let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
+
+                if state == STATE_DRAGGING {
+                    use windows::Win32::Graphics::Gdi::ScreenToClient;
+                    let mut cp = info_hook.pt;
+                    let _ = ScreenToClient(wv, &mut cp);
+                    forward(msg, &info_hook, cp.x, cp.y);
+
+                    // Forward to SysListView32 to draw the blue selection rectangle
+                    if icons_visible && !slv.is_invalid() {
+                        let mut slv_cp = info_hook.pt;
+                        let _ = ScreenToClient(slv, &mut slv_cp);
+                        let lp = LPARAM(((slv_cp.x as u16 as u32) | ((slv_cp.y as u16 as u32) << 16)) as isize);
+                        let _ = PostMessageW(slv, msg, wparam, lp);
+                    }
+
+                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
+                    return LRESULT(1);
+                }
+
+                if is_down {
+                    if is_icon && icons_visible {
+                        HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    }
+                    HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
+                }
+
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
-
-                // Forward the event to Wry so the WebView wallpaper reacts (e.g., hover effects, ripples).
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                // ALWAYS pass the event to the OS natively!
-                // This is crucial for native desktop interactions (selection boxes, dragging icons, context menus).
-                // Since WebView2 in Composition Mode ignores native HWND inputs anyway,
-                // there is absolutely no double-click conflict when WindowFromPoint hits the WebView surface.
-                CallNextHookEx(hook_h, code, wparam, lparam)
+                // First click on empty space → trigger the blue selection rectangle
+                if icons_visible && !slv.is_invalid() {
+                    let mut slv_cp = info_hook.pt;
+                    let _ = ScreenToClient(slv, &mut slv_cp);
+                    let lp = LPARAM(((slv_cp.x as u16 as u32) | ((slv_cp.y as u16 as u32) << 16)) as isize);
+                    let _ = PostMessageW(slv, msg, wparam, lp);
+                }
+
+                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
+                LRESULT(1)
             }
 
             unsafe {
