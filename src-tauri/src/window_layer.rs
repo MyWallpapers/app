@@ -303,6 +303,7 @@ pub mod mouse_hook {
     use log::{error, info};
     use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     const MOUSE_MOVE: i32 = 0x0200; const MOUSE_LDOWN: i32 = 0x0201; const MOUSE_LUP: i32 = 0x0202;
