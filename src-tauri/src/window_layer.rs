@@ -506,14 +506,17 @@ pub mod mouse_hook {
                         info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (browser pid={} matches app via process tree)",
                             hwnd_under.0 as isize, browser_pid);
 
-                        // Disable the RWHH so WindowFromPoint skips it entirely.
-                        // Clicks will natively fall through to SysListView32.
-                        // Push it to z-bottom so it never intercepts hit-testing.
+                        // Disable RWHH AND its parent Chrome_WidgetWin_1 so
+                        // WindowFromPoint skips both. Without this, disabling
+                        // only RWHH causes WindowFromPoint to land on Chrome_WidgetWin_1.
                         use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
                         let _ = EnableWindow(hwnd_under, false);
                         let _ = SetWindowPos(hwnd_under, HWND_BOTTOM, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                        info!("[is_over_desktop] RWHH disabled + pushed to HWND_BOTTOM");
+                        let _ = EnableWindow(direct_parent, false);
+                        let _ = SetWindowPos(direct_parent, HWND_BOTTOM, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        info!("[is_over_desktop] RWHH + Chrome_WidgetWin_1 disabled + HWND_BOTTOM");
 
                         return true;
                     }
