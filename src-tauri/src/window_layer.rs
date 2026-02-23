@@ -424,6 +424,34 @@ pub mod mouse_hook {
     }
 
     #[inline]
+    unsafe fn get_parent_process_id(pid: u32) -> Option<u32> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::Foundation::CloseHandle;
+
+        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            if !snap.is_invalid() {
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                if Process32FirstW(snap, &mut entry).is_ok() {
+                    loop {
+                        if entry.th32ProcessID == pid {
+                            let _ = CloseHandle(snap);
+                            return Some(entry.th32ParentProcessID);
+                        }
+                        if Process32NextW(snap, &mut entry).is_err() { break; }
+                    }
+                }
+                let _ = CloseHandle(snap);
+            }
+        }
+        None
+    }
+
+    #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
@@ -463,19 +491,28 @@ pub mod mouse_hook {
         // Auto-discover Chrome_RWHH — check if the PARENT's PID matches our app.
         // RWHH itself is in the renderer process (different PID), but its parent
         // Chrome_WidgetWin_1 is in the browser process. For OUR WebView2, that
-        // browser process IS our app. For the user's Chrome, it's Chrome.exe.
+        // browser process is a child of our app.
         if rwhh.is_invalid() && !wv.is_invalid() {
             if cls_name == "Chrome_RenderWidgetHostHWND" {
                 let direct_parent = GetParent(hwnd_under).unwrap_or_default();
                 if !direct_parent.is_invalid() {
-                    let mut parent_pid: u32 = 0;
-                    let mut wv_pid: u32 = 0;
-                    GetWindowThreadProcessId(direct_parent, Some(&mut parent_pid));
-                    GetWindowThreadProcessId(wv, Some(&mut wv_pid));
-                    if parent_pid == wv_pid {
+                    let mut browser_pid: u32 = 0;
+                    GetWindowThreadProcessId(direct_parent, Some(&mut browser_pid));
+                    let our_pid = std::process::id();
+
+                    let mut is_ours = browser_pid == our_pid;
+                    if !is_ours {
+                        if let Some(browser_parent_pid) = get_parent_process_id(browser_pid) {
+                            if browser_parent_pid == our_pid {
+                                is_ours = true;
+                            }
+                        }
+                    }
+
+                    if is_ours {
                         CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                        info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (parent pid={} matches app)",
-                            hwnd_under.0 as isize, parent_pid);
+                        info!("[is_over_desktop] OUR Chrome_RWHH at 0x{:X} (browser pid={} matches app via process tree)",
+                            hwnd_under.0 as isize, browser_pid);
                         return true;
                     }
                 }
