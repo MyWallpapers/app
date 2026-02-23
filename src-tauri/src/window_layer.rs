@@ -315,7 +315,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use log::{error, info};
-    use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -334,9 +334,6 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
-
-    const STATE_IDLE: u8 = 0; const STATE_DRAGGING: u8 = 1; const STATE_NATIVE: u8 = 2;
-    static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -517,44 +514,6 @@ pub mod mouse_hook {
     }
 
     #[inline]
-    unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::Win32::System::Variant::VT_I4;
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
-        use windows::Win32::Foundation::HWND;
-        use windows::core::Interface;
-
-        let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-        if slv == 0 { return false; }
-
-        // Query SysListView32 directly via OBJID_CLIENT (0xFFFFFFFC).
-        // This bypasses the floating Chrome_RenderWidgetHostHWND that
-        // intercepts AccessibleObjectFromPoint.
-        let mut p_acc: *mut core::ffi::c_void = core::ptr::null_mut();
-        let hr = AccessibleObjectFromWindow(
-            HWND(slv as *mut _),
-            0xFFFFFFFC,
-            &IAccessible::IID,
-            &mut p_acc,
-        );
-        if hr.is_err() || p_acc.is_null() { return false; }
-        let acc: IAccessible = core::mem::transmute(p_acc);
-
-        match acc.accHitTest(x, y) {
-            Ok(hit) => {
-                let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                // VT_I4 with positive child ID = icon hit.
-                // VT_DISPATCH = empty space → return false for selection box.
-                if vt == VT_I4.0 as u16 {
-                    hit.as_raw().Anonymous.Anonymous.Anonymous.lVal > 0
-                } else {
-                    false
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
-    #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
             WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, cx, cy),
@@ -591,8 +550,6 @@ pub mod mouse_hook {
 
                 let info_hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
                 let msg = wparam.0 as u32;
-                let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-                let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
 
                 let hwnd_under = WindowFromPoint(info_hook.pt);
                 let wv = HWND(wv_raw as *mut _);
@@ -614,64 +571,62 @@ pub mod mouse_hook {
                     info!("[hook] {} 0x{:X} '{}' is_over_desktop={}", tag, hwnd_under.0 as isize, cls_name, over);
                 }
 
-                // STATE_NATIVE first — zero overhead during native icon interactions.
-                // This must come BEFORE is_over_desktop/is_icon to keep the hook
-                // fast enough for double-clicks and drag-and-drop to work.
-                let state = HOOK_STATE.load(Ordering::Relaxed);
-                if state == STATE_NATIVE {
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
-
                 if !is_over_desktop(hwnd_under) { return CallNextHookEx(hook_h, code, wparam, lparam); }
 
-                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-                let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
-
-                if state == STATE_DRAGGING {
-                    use windows::Win32::Graphics::Gdi::ScreenToClient;
-                    let mut cp = info_hook.pt;
-                    let _ = ScreenToClient(wv, &mut cp);
-                    forward(msg, &info_hook, cp.x, cp.y);
-
-                    // Forward to SysListView32 to draw the blue selection rectangle
-                    if icons_visible && !slv.is_invalid() {
-                        let mut slv_cp = info_hook.pt;
-                        let _ = ScreenToClient(slv, &mut slv_cp);
-                        let lp = LPARAM(((slv_cp.x as u16 as u32) | ((slv_cp.y as u16 as u32) << 16)) as isize);
-                        let _ = PostMessageW(slv, msg, wparam, lp);
-                    }
-
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
-                    return LRESULT(1);
-                }
-
-                // IDLE: only call expensive COM hit-test on mouse-down, not every move
-                if is_down {
-                    let is_icon = is_mouse_over_desktop_icon(info_hook.pt.x, info_hook.pt.y);
-                    if is_icon && icons_visible {
-                        HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
-                    }
-                    HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
-                }
-
+                // Forward to WebView (composition mode receives input via SendMouseInput)
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(wv, &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                // First click on empty space → trigger the blue selection rectangle
+                // Forward to SysListView32 for icon interactions + selection rectangle
+                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
+                let icons_visible = if !slv.is_invalid() { IsWindowVisible(slv).as_bool() } else { false };
+
                 if icons_visible && !slv.is_invalid() {
-                    let mut slv_cp = info_hook.pt;
-                    let _ = ScreenToClient(slv, &mut slv_cp);
-                    let lp = LPARAM(((slv_cp.x as u16 as u32) | ((slv_cp.y as u16 as u32) << 16)) as isize);
-                    let _ = PostMessageW(slv, msg, wparam, lp);
+                    let lp;
+                    if msg == 0x020A || msg == 0x020E { // WM_MOUSEWHEEL, WM_MOUSEHWHEEL
+                        // Wheel events use screen coordinates in lParam
+                        lp = ((info_hook.pt.x as i16 as u16 as u32) | ((info_hook.pt.y as i16 as u16 as u32) << 16)) as isize;
+                    } else {
+                        let mut slv_cp = info_hook.pt;
+                        let _ = ScreenToClient(slv, &mut slv_cp);
+                        lp = ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16)) as isize;
+                    }
+
+                    let mut out_msg = msg;
+                    if msg == 0x0201 { // WM_LBUTTONDOWN
+                        // Manual double-click detection: low-level hooks only see
+                        // WM_LBUTTONDOWN, never WM_LBUTTONDBLCLK. We must synthesize it.
+                        static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        static LAST_DOWN_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                        static LAST_DOWN_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+                        let now = info_hook.time;
+                        let last_time = LAST_DOWN_TIME.load(Ordering::Relaxed);
+                        let dt = now.saturating_sub(last_time);
+                        let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
+                        let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
+
+                        let max_time = GetDoubleClickTime();
+                        let max_dx = GetSystemMetrics(SM_CXDOUBLECLK) / 2;
+                        let max_dy = GetSystemMetrics(SM_CYDOUBLECLK) / 2;
+
+                        if dt > 0 && dt <= max_time && dx <= max_dx && dy <= max_dy {
+                            out_msg = 0x0203; // WM_LBUTTONDBLCLK
+                            LAST_DOWN_TIME.store(0, Ordering::Relaxed);
+                        } else {
+                            LAST_DOWN_TIME.store(now, Ordering::Relaxed);
+                            LAST_DOWN_X.store(info_hook.pt.x, Ordering::Relaxed);
+                            LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
+                        }
+                    }
+
+                    let _ = PostMessageW(slv, out_msg, wparam, LPARAM(lp));
                 }
 
-                if msg == WM_MOUSEMOVE { return CallNextHookEx(hook_h, code, wparam, lparam); }
-                LRESULT(1)
+                // Always let OS propagate — needed for DoDragDrop native handling
+                CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
             unsafe {
