@@ -39,14 +39,8 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
-                if let Err(e) =
-                    ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE })
-                {
-                    info!(
-                        "[window_layer] ShowWindow(icons, visible={}) failed: {:?}",
-                        visible, e
-                    );
-                }
+                // ShowWindow returns BOOL (previous visibility state), not Result
+                let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE });
             }
         }
     }
@@ -65,9 +59,8 @@ pub fn restore_desktop_icons_and_unhook() {
             let slv = mouse_hook::get_syslistview_hwnd();
             if slv != 0 {
                 unsafe {
-                    if let Err(e) = ShowWindow(HWND(slv as *mut _), SW_SHOW) {
-                        error!("[window_layer] Restore desktop icons failed: {:?}", e);
-                    }
+                    // ShowWindow returns BOOL (previous visibility state), not Result
+                    let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW);
                 }
             }
 
@@ -148,8 +141,8 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         );
         std::thread::sleep(std::time::Duration::from_millis(150));
 
-        let mut target_parent = HWND::default();
-        let mut shell_for_slv = HWND::default();
+        let mut target_parent;
+        let mut shell_for_slv;
 
         // 1. Detection Win11 24H2+: SHELLDLL_DefView is direct child of Progman
         let shell_view = FindWindowExW(
