@@ -23,18 +23,33 @@ fn mw_init_script() -> String {
 pub use commands::*;
 
 pub fn main() {
+    // Clean up old log files, keeping the most recent ones for forensics.
     #[cfg(target_os = "windows")]
     if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-        let log_dir = std::path::Path::new(&local_appdata)
-            .join("com.mywallpaper.desktop")
-            .join("logs");
-        if let Ok(entries) = std::fs::read_dir(&log_dir) {
-            entries
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
-                .for_each(|e| {
-                    let _ = std::fs::remove_file(e.path());
-                });
+        const MAX_LOG_FILES: usize = 5;
+        let base = std::path::Path::new(&local_appdata);
+        let log_dir = base.join("com.mywallpaper.desktop").join("logs");
+        // Resolve symlinks and verify the log dir is still under LOCALAPPDATA
+        if let (Ok(canonical_dir), Ok(canonical_base)) =
+            (log_dir.canonicalize(), base.canonicalize())
+        {
+            if canonical_dir.starts_with(&canonical_base) {
+                if let Ok(entries) = std::fs::read_dir(&canonical_dir) {
+                    let mut logs: Vec<_> = entries
+                        .flatten()
+                        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+                        .filter_map(|e| {
+                            let modified = e.metadata().ok()?.modified().ok()?;
+                            Some((e.path(), modified))
+                        })
+                        .collect();
+                    // Sort newest first, delete everything beyond the retention limit
+                    logs.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (path, _) in logs.into_iter().skip(MAX_LOG_FILES) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
         }
     }
 
@@ -81,7 +96,7 @@ fn start_with_tauri_webview() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 args.into_iter()
-                    .filter(|a| a.starts_with("mywallpaper://"))
+                    .filter_map(|a| commands_core::validate_deep_link(&a))
                     .for_each(|url| {
                         let _ = window.emit("deep-link", url);
                     });
@@ -103,7 +118,7 @@ fn start_with_tauri_webview() {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                     if let Some(window) = deep_link_handle.get_webview_window("main") {
                         urls.into_iter()
-                            .filter(|u| u.starts_with("mywallpaper://"))
+                            .filter_map(|u| commands_core::validate_deep_link(&u))
                             .for_each(|url| {
                                 let _ = window.emit("deep-link", url);
                             });

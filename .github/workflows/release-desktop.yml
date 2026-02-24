@@ -138,6 +138,8 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_STRIP=none" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
           echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
+          # Re-enable WebView devtools for dev builds (disabled in production config)
+          sed -i 's/"devtools": false/"devtools": true/' src-tauri/tauri.conf.json
 
       - name: Build
         shell: bash

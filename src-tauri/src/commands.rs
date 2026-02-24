@@ -43,6 +43,8 @@ pub async fn check_for_updates(
 
     match updater.check().await {
         Ok(Some(update)) => {
+            // Reject downgrades to prevent rollback attacks
+            commands_core::validate_update_version(env!("CARGO_PKG_VERSION"), &update.version)?;
             info!("[updater] Update available: v{}", update.version);
             Ok(Some(UpdateInfo {
                 version: update.version.clone(),
@@ -76,6 +78,9 @@ pub async fn download_and_install_update(
         .await
         .map_err(|e| format!("Update check failed: {}", e))?
         .ok_or_else(|| "No update available".to_string())?;
+
+    // Reject downgrades to prevent rollback attacks
+    commands_core::validate_update_version(env!("CARGO_PKG_VERSION"), &update.version)?;
 
     emit_status("downloading");
     update

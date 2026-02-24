@@ -37,7 +37,14 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
-                let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE });
+                if let Err(e) =
+                    ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE })
+                {
+                    info!(
+                        "[window_layer] ShowWindow(icons, visible={}) failed: {:?}",
+                        visible, e
+                    );
+                }
             }
         }
     }
@@ -59,14 +66,18 @@ pub fn restore_desktop_icons_and_unhook() {
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
-                let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW);
+                if let Err(e) = ShowWindow(HWND(slv as *mut _), SW_SHOW) {
+                    error!("[window_layer] Restore desktop icons failed: {:?}", e);
+                }
             }
         }
 
         let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
         if hook_ptr != 0 {
             unsafe {
-                let _ = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _));
+                if let Err(e) = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)) {
+                    error!("[window_layer] Unhook mouse hook failed: {:?}", e);
+                }
             }
         }
     }
@@ -121,11 +132,14 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         let mut explorer_pid: u32 = 0;
         GetWindowThreadProcessId(progman, Some(&mut explorer_pid));
 
-        // Force Windows to spawn the wallpaper WorkerW layer
+        // Force Windows to spawn the wallpaper WorkerW layer.
+        // This is an undocumented Progman message discovered via reverse engineering;
+        // it triggers creation of the WorkerW window behind the desktop icons.
+        const PROGMAN_SPAWN_WORKERW: u32 = 0x052C;
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(
             progman,
-            0x052C,
+            PROGMAN_SPAWN_WORKERW,
             WPARAM(0x0D),
             LPARAM(1),
             SMTO_NORMAL,
@@ -163,6 +177,9 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             };
 
             unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+                if lp.0 == 0 {
+                    return BOOL(0);
+                }
                 let sv = FindWindowExW(
                     hwnd,
                     HWND::default(),
@@ -191,6 +208,9 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
         let mut syslistview = HWND::default();
         unsafe extern "system" fn find_slv(hwnd: HWND, lp: LPARAM) -> BOOL {
+            if lp.0 == 0 {
+                return BOOL(0);
+            }
             if is_class_name(hwnd, "SysListView32") {
                 *(lp.0 as *mut HWND) = hwnd;
                 return BOOL(0);
@@ -224,6 +244,9 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             rect: *mut RECT,
             lparam: LPARAM,
         ) -> BOOL {
+            if lparam.0 == 0 || rect.is_null() {
+                return BOOL(1);
+            }
             let data = &mut *(lparam.0 as *mut MonitorRects);
             if rect.read().left < data.left {
                 data.left = rect.read().left;
@@ -443,6 +466,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                     }
                     let fd = FixData { w, h };
                     unsafe extern "system" fn enum_fix_children(child: HWND, lp: LPARAM) -> BOOL {
+                        if lp.0 == 0 {
+                            return BOOL(0);
+                        }
                         let d = &*(lp.0 as *const FixData);
                         let mut st = GetWindowLongW(child, GWL_STYLE) as u32;
                         st &= !(WS_BORDER.0 | WS_THICKFRAME.0 | WS_DLGFRAME.0 | WS_CAPTION.0);
@@ -577,6 +603,12 @@ pub mod mouse_hook {
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
+        // Encoding packs 3 fields into a single usize via bit shifts.
+        // The <<32 shift requires a 64-bit pointer width; on 32-bit it would silently lose data.
+        const _: () = assert!(
+            std::mem::size_of::<usize>() >= 8,
+            "mouse hook encoding requires 64-bit pointer width"
+        );
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
         if dh == 0 {
             return;
@@ -810,9 +842,8 @@ pub mod mouse_hook {
                 wparam: WPARAM,
                 lparam: LPARAM,
             ) -> LRESULT {
-                let hook_h = HHOOK(
-                    crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _,
-                );
+                let hook_h =
+                    HHOOK(crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst) as *mut _);
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
 
                 if code < 0 || wv_raw == 0 {
@@ -835,7 +866,7 @@ pub mod mouse_hook {
                 // Forward to SysListView32 for icon interactions + selection rectangle
                 let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
                 if !slv.is_invalid() && IsWindowVisible(slv).as_bool() {
-                    let lp = if msg == 0x020A || msg == 0x020E {
+                    let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
                         ((info_hook.pt.x as i16 as u16 as u32)
                             | ((info_hook.pt.y as i16 as u16 as u32) << 16))
                             as isize
@@ -847,8 +878,11 @@ pub mod mouse_hook {
                     };
 
                     let mut out_msg = msg;
-                    if msg == 0x0201 {
-                        // WM_LBUTTONDOWN — synthesize double-click
+                    if msg == WM_LBUTTONDOWN {
+                        // Synthesize double-click for SysListView32.
+                        // SAFETY: WH_MOUSE_LL callbacks are serialized by Windows —
+                        // only one invocation runs at a time on this thread, so
+                        // Relaxed ordering is correct and no race can occur.
                         static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
                             std::sync::atomic::AtomicU32::new(0);
                         static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
@@ -866,7 +900,7 @@ pub mod mouse_hook {
                             && dx <= DBLCLICK_CX.load(Ordering::Relaxed)
                             && dy <= DBLCLICK_CY.load(Ordering::Relaxed)
                         {
-                            out_msg = 0x0203; // WM_LBUTTONDBLCLK
+                            out_msg = WM_LBUTTONDBLCLK;
                             LAST_DOWN_TIME.store(0, Ordering::Relaxed);
                         } else {
                             LAST_DOWN_TIME.store(now, Ordering::Relaxed);

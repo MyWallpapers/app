@@ -48,7 +48,7 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self' https://dev.mywallpaper.online https://*.mywallpaper.online http://localhost:*; img-src 'self' data: https: http://localhost:*; media-src 'self' data: blob: https: http://localhost:*; script-src 'self' 'unsafe-inline' https://dev.mywallpaper.online http://localhost:*; style-src 'self' 'unsafe-inline' https://dev.mywallpaper.online http://localhost:*; connect-src 'self' ipc: http://ipc.localhost https://dev.mywallpaper.online https://*.mywallpaper.online https://api.github.com wss://dev.mywallpaper.online wss://*.mywallpaper.online http://localhost:*; frame-src 'self' https: http://localhost:*;"
+      "csp": "default-src 'self' https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online; img-src 'self' data: https: http://localhost:*; media-src 'self' data: blob: https: http://localhost:*; script-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online; style-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online; connect-src 'self' ipc: http://ipc.localhost https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online https://api.github.com wss://dev.mywallpaper.online wss://app.mywallpaper.online; frame-src 'self' https://dev.mywallpaper.online https://app.mywallpaper.online;"
     },
     "windows": [
       {
@@ -65,7 +65,7 @@
         "closable": true,
         "focus": false,
         "visible": false,
-        "devtools": true,
+        "devtools": false,
         "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
     ],
