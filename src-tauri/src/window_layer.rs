@@ -2,11 +2,13 @@
 
 #[cfg(target_os = "windows")]
 use log::{error, info};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
-static HOOK_HANDLE_GLOBAL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 
 // ==============================================================================
 // Public API
@@ -51,32 +53,30 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::needless_return)]
 pub fn restore_desktop_icons_and_unhook() {
-    if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            ShowWindow, UnhookWindowsHookEx, HHOOK, SW_SHOW,
-        };
+    if !ICONS_RESTORED.swap(true, Ordering::SeqCst) {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                ShowWindow, UnhookWindowsHookEx, HHOOK, SW_SHOW,
+            };
 
-        let slv = mouse_hook::get_syslistview_hwnd();
-        if slv != 0 {
-            unsafe {
-                if let Err(e) = ShowWindow(HWND(slv as *mut _), SW_SHOW) {
-                    error!("[window_layer] Restore desktop icons failed: {:?}", e);
+            let slv = mouse_hook::get_syslistview_hwnd();
+            if slv != 0 {
+                unsafe {
+                    if let Err(e) = ShowWindow(HWND(slv as *mut _), SW_SHOW) {
+                        error!("[window_layer] Restore desktop icons failed: {:?}", e);
+                    }
                 }
             }
-        }
 
-        let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
-        if hook_ptr != 0 {
-            unsafe {
-                if let Err(e) = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)) {
-                    error!("[window_layer] Unhook mouse hook failed: {:?}", e);
+            let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
+            if hook_ptr != 0 {
+                unsafe {
+                    if let Err(e) = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)) {
+                        error!("[window_layer] Unhook mouse hook failed: {:?}", e);
+                    }
                 }
             }
         }
@@ -248,18 +248,11 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
                 return BOOL(1);
             }
             let data = &mut *(lparam.0 as *mut MonitorRects);
-            if rect.read().left < data.left {
-                data.left = rect.read().left;
-            }
-            if rect.read().top < data.top {
-                data.top = rect.read().top;
-            }
-            if rect.read().right > data.right {
-                data.right = rect.read().right;
-            }
-            if rect.read().bottom > data.bottom {
-                data.bottom = rect.read().bottom;
-            }
+            let r = rect.read();
+            data.left = data.left.min(r.left);
+            data.top = data.top.min(r.top);
+            data.right = data.right.max(r.right);
+            data.bottom = data.bottom.max(r.bottom);
             BOOL(1)
         }
         let _ = EnumDisplayMonitors(
@@ -549,10 +542,12 @@ pub mod mouse_hook {
     const MOUSE_MUP: i32 = 0x0208;
     const MOUSE_WHEEL: i32 = 0x020A;
     const MOUSE_HWHEEL: i32 = 0x020E;
-    const VK_NONE: i32 = 0x0;
-    const VK_LBUTTON: i32 = 0x1;
-    const VK_RBUTTON: i32 = 0x2;
-    const VK_MBUTTON: i32 = 0x10;
+    const MK_NONE: i32 = 0x0;
+    const MK_LBUTTON: i32 = 0x0001;
+    const MK_RBUTTON: i32 = 0x0002;
+    const MK_SHIFT: i32 = 0x0004;
+    const MK_CONTROL: i32 = 0x0008;
+    const MK_MBUTTON: i32 = 0x0010;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -565,7 +560,8 @@ pub mod mouse_hook {
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
 
-    // Cached system metrics for double-click detection (avoid Win32 calls in hook hot path)
+    // Cached values to avoid syscalls in hook hot path
+    static OUR_PID: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -758,7 +754,7 @@ pub mod mouse_hook {
             if !direct_parent.is_invalid() {
                 let mut browser_pid: u32 = 0;
                 GetWindowThreadProcessId(direct_parent, Some(&mut browser_pid));
-                let our_pid = std::process::id();
+                let our_pid = OUR_PID.load(Ordering::Relaxed);
 
                 let is_ours = browser_pid == our_pid
                     || get_parent_process_id(browser_pid).is_some_and(|ppid| ppid == our_pid);
@@ -783,28 +779,28 @@ pub mod mouse_hook {
                 cy,
             ),
             WM_LBUTTONDOWN => {
-                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, cx, cy);
+                DRAG_VK.store(MK_LBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_LDOWN, MK_LBUTTON, 0, cx, cy);
             }
             WM_LBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_LUP, VK_NONE, 0, cx, cy);
+                post_mouse(MOUSE_LUP, MK_NONE, 0, cx, cy);
             }
             WM_RBUTTONDOWN => {
-                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, cx, cy);
+                DRAG_VK.store(MK_RBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_RDOWN, MK_RBUTTON, 0, cx, cy);
             }
             WM_RBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_RUP, VK_NONE, 0, cx, cy);
+                post_mouse(MOUSE_RUP, MK_NONE, 0, cx, cy);
             }
             WM_MBUTTONDOWN => {
-                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
-                post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, cx, cy);
+                DRAG_VK.store(MK_MBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_MDOWN, MK_MBUTTON, 0, cx, cy);
             }
             WM_MBUTTONUP => {
                 DRAG_VK.store(0, Ordering::Relaxed);
-                post_mouse(MOUSE_MUP, VK_NONE, 0, cx, cy);
+                post_mouse(MOUSE_MUP, MK_NONE, 0, cx, cy);
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                 let kind = if msg == WM_MOUSEWHEEL {
@@ -814,7 +810,7 @@ pub mod mouse_hook {
                 };
                 post_mouse(
                     kind,
-                    VK_NONE,
+                    MK_NONE,
                     (info_hook.mouseData >> 16) as i16 as i32 as u32,
                     cx,
                     cy,
@@ -830,7 +826,8 @@ pub mod mouse_hook {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-                // Cache double-click metrics once at hook startup
+                // Cache process ID + double-click metrics once at hook startup
+                OUR_PID.store(std::process::id(), Ordering::Relaxed);
                 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
                 DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
                 DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
@@ -842,8 +839,10 @@ pub mod mouse_hook {
                 wparam: WPARAM,
                 lparam: LPARAM,
             ) -> LRESULT {
-                let hook_h =
-                    HHOOK(crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst) as *mut _);
+                // Relaxed is correct: stored on this same thread before SetWindowsHookExW returned
+                let hook_h = HHOOK(
+                    crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _,
+                );
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
 
                 if code < 0 || wv_raw == 0 {
@@ -908,7 +907,37 @@ pub mod mouse_hook {
                             LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
                         }
                     }
-                    let _ = PostMessageW(slv, out_msg, wparam, LPARAM(lp));
+                    // Build correct MK_* key state flags (the hook's wparam is the
+                    // message type, NOT the key state SysListView32 expects).
+                    let slv_wparam = {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                        let mut mk: u16 = 0;
+                        if out_msg == WM_LBUTTONDOWN
+                            || out_msg == WM_LBUTTONDBLCLK
+                            || GetAsyncKeyState(0x01) < 0
+                        {
+                            mk |= 0x0001; // MK_LBUTTON
+                        }
+                        if out_msg == WM_RBUTTONDOWN || GetAsyncKeyState(0x02) < 0 {
+                            mk |= 0x0002; // MK_RBUTTON
+                        }
+                        if out_msg == WM_MBUTTONDOWN || GetAsyncKeyState(0x04) < 0 {
+                            mk |= 0x0010; // MK_MBUTTON
+                        }
+                        if GetAsyncKeyState(0x10) < 0 {
+                            mk |= 0x0004; // MK_SHIFT
+                        }
+                        if GetAsyncKeyState(0x11) < 0 {
+                            mk |= 0x0008; // MK_CONTROL
+                        }
+                        if out_msg == WM_MOUSEWHEEL || out_msg == WM_MOUSEHWHEEL {
+                            let delta = (info_hook.mouseData >> 16) as u16;
+                            WPARAM(((delta as usize) << 16) | mk as usize)
+                        } else {
+                            WPARAM(mk as usize)
+                        }
+                    };
+                    let _ = PostMessageW(slv, out_msg, slv_wparam, LPARAM(lp));
                 }
 
                 CallNextHookEx(hook_h, code, wparam, lparam)

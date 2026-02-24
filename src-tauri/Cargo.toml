@@ -9,7 +9,7 @@ edition = "2021"
 
 [lib]
 name = "mywallpaper_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
@@ -53,10 +53,6 @@ features = [
 # Direct dependency on wry for WebViewExtWindows + composition_controller access
 [target.'cfg(target_os = "windows")'.dependencies]
 wry = "0.53.5"
-webview2-com = "0.38"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc = "0.2"
 
 [features]
 default = ["custom-protocol"]

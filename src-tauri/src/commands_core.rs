@@ -3,12 +3,12 @@
 //! These functions contain the actual business logic, free of `tauri::` types.
 //! Tauri command wrappers in `commands.rs` call into these.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use typeshare::typeshare;
 
 /// System information response
 #[typeshare]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct SystemInfo {
     pub os: String,
     pub os_version: String,
@@ -19,7 +19,7 @@ pub struct SystemInfo {
 
 /// Update information response
 #[typeshare]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct UpdateInfo {
     pub version: String,
     pub current_version: String,

@@ -8,8 +8,9 @@ mod tray;
 mod window_layer;
 
 use log::{error, info};
+use std::sync::LazyLock;
 
-fn mw_init_script() -> String {
+static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"window.__MW_INIT__ = {{ isTauri: true, platform: "{}", arch: "{}", appVersion: "{}", tauriVersion: "{}", debug: {} }};"#,
         std::env::consts::OS,
@@ -18,9 +19,7 @@ fn mw_init_script() -> String {
         tauri::VERSION,
         cfg!(debug_assertions),
     )
-}
-
-pub use commands::*;
+});
 
 pub fn main() {
     // Clean up old log files, keeping the most recent ones for forensics.
@@ -104,7 +103,7 @@ fn start_with_tauri_webview() {
         }))
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
-                let _ = webview.eval(mw_init_script());
+                let _ = webview.eval(&*MW_INIT_SCRIPT);
             }
         })
         .setup(|app| {
