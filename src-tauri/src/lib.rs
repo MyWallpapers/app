@@ -4,6 +4,7 @@
 
 mod commands;
 mod commands_core;
+mod system_monitor;
 mod tray;
 mod window_layer;
 
@@ -85,6 +86,7 @@ fn start_with_tauri_webview() {
                 .build(),
         )
         .plugin(tauri_plugin_process::init())
+        // MacosLauncher is required by the API but inert on Windows
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -131,10 +133,14 @@ fn start_with_tauri_webview() {
                 let _ = window.show();
             }
 
+            system_monitor::start_monitor(handle.clone(), 3);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_system_info,
+            commands::get_system_data,
+            commands::subscribe_system_data,
             commands::check_for_updates,
             commands::download_and_install_update,
             commands::restart_app,

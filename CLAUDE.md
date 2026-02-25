@@ -1,6 +1,6 @@
 # MyWallpaper Desktop (Tauri v2)
 
-Animated wallpaper application — window injected behind desktop icons on Windows/macOS.
+Animated wallpaper application — window injected behind desktop icons on Windows.
 Frontend loaded remotely from `dev.mywallpaper.online` (no local build).
 
 ## Commands
@@ -27,14 +27,12 @@ gh workflow run "Desktop Release" --field bump=patch --field mode=prod
 The CI automatically:
 1. Bumps version in `tauri.conf.json`, `Cargo.toml`, `package.json`
 2. Commits `release: desktop vX.Y.Z` and tags `vX.Y.Z` (or `vX.Y.Z-dev`)
-3. Builds Windows + macOS (ARM + x86) in parallel
+3. Builds Windows in parallel
 4. Signs updater artifacts with minisign
 5. Generates `latest.json` updater manifest
 6. Publishes GitHub release
 
 **bump options**: `patch` (1.0.X+1), `minor` (1.X+1.0), `major` (X+1.0.0)
-
-Linux builds are paused (WebGPU support pending).
 
 ## Architecture
 
@@ -44,6 +42,7 @@ src-tauri/src/
 ├── lib.rs             # App init, plugins, window setup, invoke_handler
 ├── commands.rs        # Tauri IPC command wrappers
 ├── commands_core.rs   # Platform-independent business logic + types
+├── system_monitor.rs  # System data collection (CPU, memory, battery, disk, network)
 ├── tray.rs            # System tray (quit only)
 └── window_layer.rs    # Desktop injection + mouse engine + visibility watchdog
 ```
@@ -52,27 +51,37 @@ src-tauri/src/
 
 The core of the app. Three subsystems:
 
-1. **WorkerW Injection** (Windows) — Detects OS architecture (Win11 24H2+ vs Legacy), injects WebView as child of WorkerW/Progman with correct Z-order
-2. **Mouse Hook** (Windows) — Low-level `WH_MOUSE_LL` hook with MSAA-based icon detection (`ROLE_SYSTEM_LISTITEM = 34`). State machine: IDLE/NATIVE/WEB. Forwards web clicks to `Chrome_RenderWidgetHostHWND`
-3. **macOS Desktop** — `kCGDesktopWindowLevel`, `CGEventTap` for click forwarding, Finder-based icon toggle
-4. **Visibility Watchdog** — Polls foreground window every 2s, emits `wallpaper-visibility` event when fullscreen app covers wallpaper (multi-monitor aware)
+1. **WorkerW Injection** — Detects OS architecture (Win11 24H2+ vs Legacy), injects WebView as child of WorkerW/Progman with correct Z-order
+2. **Mouse Hook** — Low-level `WH_MOUSE_LL` hook with MSAA-based icon detection (`ROLE_SYSTEM_LISTITEM = 34`). State machine: IDLE/NATIVE/WEB. Forwards web clicks to `Chrome_RenderWidgetHostHWND`
+3. **Visibility Watchdog** — Polls foreground window every 2s, emits `wallpaper-visibility` event when fullscreen app covers wallpaper (multi-monitor aware)
+
+### System Monitor (`system_monitor.rs`)
+
+Exposes system data to widgets via Tauri IPC:
+
+- **Categories**: `cpu`, `memory`, `battery`, `disk`, `network`
+- **One-shot**: `get_system_data(categories)` returns filtered `SystemData`
+- **Real-time**: Background thread polls every 3s, emits `system-data-update` event
+- **Permission-gated**: Frontend filters data per widget based on manifest capabilities
 
 ### Tauri Commands (IPC)
 
 | Command | Description |
 |---|---|
 | `get_system_info` | OS, arch, app/Tauri version |
+| `get_system_data` | CPU, memory, battery, disk, network (filtered by categories) |
+| `subscribe_system_data` | Update monitor poll categories for real-time updates |
 | `check_for_updates` | Check GitHub releases (supports custom endpoint for pre-release) |
 | `download_and_install_update` | Download + install with progress events |
 | `restart_app` | Restart to apply update |
 | `open_oauth_in_browser` | Open OAuth URL in default browser |
 | `reload_window` | Emit reload event to frontend |
-| `set_desktop_icons_visible` | Show/hide native desktop icons (Windows: ShowWindow, macOS: Finder defaults) |
+| `set_desktop_icons_visible` | Show/hide native desktop icons (Windows: ShowWindow) |
 
 ### Safety
 
 - `restore_desktop_icons()` runs on both `ExitRequested` and tray quit — icons always restored
-- `ICONS_RESTORED` atomic flag prevents double-restore (avoids double `killall Finder` on macOS)
+- `ICONS_RESTORED` atomic flag prevents double-restore
 
 ### Auto-Updater
 
@@ -91,4 +100,4 @@ The core of the app. Three subsystems:
 - **Error handling**: `Result<T, String>` for commands, `.expect()` only in `main.rs`
 - **Platform code**: Use `#[cfg(target_os = "...")]` guards, not runtime checks
 - **Comments**: French inline comments are OK (codebase convention), English for doc comments
-- **Unsafe**: Required for Win32 API, MSAA, ObjC — minimize scope, document why
+- **Unsafe**: Required for Win32 API, MSAA — minimize scope, document why

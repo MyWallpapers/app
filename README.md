@@ -1,6 +1,6 @@
 # MyWallpaper Desktop
 
-Tauri v2 desktop application for [MyWallpaper](https://dev.mywallpaper.online) — animated wallpapers with addon support for Windows, macOS, and Linux.
+Tauri v2 desktop application for [MyWallpaper](https://dev.mywallpaper.online) — animated wallpapers with addon support for Windows.
 
 The app runs as a system tray application. The window covers the full screen with no decorations, sitting behind all other windows (desktop layer). The frontend is loaded remotely from `dev.mywallpaper.online` — no local frontend build required.
 
@@ -13,9 +13,10 @@ src-tauri/
 │   ├── lib.rs             # App init, plugins, window setup
 │   ├── commands.rs        # Tauri IPC commands
 │   ├── commands_core.rs   # Platform-independent business logic
+│   ├── system_monitor.rs  # System data collection (CPU, memory, battery, disk, network)
 │   ├── tray.rs            # System tray (quit only)
 │   └── window_layer.rs    # Desktop injection, mouse engine, visibility watchdog
-├── icons/                 # App icons (all platforms)
+├── icons/                 # App icons
 ├── capabilities/          # Tauri permission capabilities
 ├── tauri.conf.json        # Tauri configuration
 └── Cargo.toml             # Rust dependencies
@@ -26,6 +27,8 @@ src-tauri/
 | Command | Description |
 |---|---|
 | `get_system_info` | OS, arch, app version, Tauri version |
+| `get_system_data` | CPU, memory, battery, disk, network (filtered by categories) |
+| `subscribe_system_data` | Update monitor poll categories for real-time updates |
 | `check_for_updates` | Check for app updates via GitHub releases |
 | `download_and_install_update` | Download and install update with progress events |
 | `restart_app` | Restart to apply update |
@@ -33,10 +36,11 @@ src-tauri/
 | `reload_window` | Emit reload event to frontend |
 | `set_desktop_icons_visible` | Show/hide native desktop icons |
 
-### Platform-specific behavior
+### Window Layer
 
-- **Windows**: WorkerW injection (Win11 24H2+ and Legacy), MSAA mouse hook with icon detection, transparent window
-- **macOS**: `kCGDesktopWindowLevel` behind desktop icons, Finder-based icon toggle, transparent window
+- **WorkerW Injection**: Detects OS architecture (Win11 24H2+ vs Legacy), injects WebView as child of WorkerW/Progman with correct Z-order
+- **Mouse Hook**: Low-level `WH_MOUSE_LL` hook with MSAA-based icon detection. State machine: IDLE/NATIVE/WEB
+- **Visibility Watchdog**: Polls foreground window every 2s, emits event when fullscreen app covers wallpaper
 
 ## Releasing
 
@@ -50,7 +54,7 @@ Releases are fully automated via GitHub Actions. Go to **Actions > Desktop Relea
 The workflow automatically:
 1. Bumps version in `tauri.conf.json`, `Cargo.toml`, `package.json`
 2. Commits and tags (`vX.Y.Z` or `vX.Y.Z-dev`)
-3. Builds for all 4 platforms in parallel
+3. Builds for Windows
 4. Creates a signed GitHub release with all installers
 
 ### Build profiles
@@ -80,10 +84,7 @@ npm run tauri:build   # Local release build
 
 - Rust (stable)
 - Node.js 20+
-- Platform dependencies:
-  - **Linux**: `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`
-  - **macOS**: Xcode Command Line Tools
-  - **Windows**: Visual Studio Build Tools, WebView2
+- Windows: Visual Studio Build Tools, WebView2
 
 ## Secrets (GitHub Actions)
 

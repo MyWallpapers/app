@@ -4,11 +4,28 @@ use crate::commands_core;
 use log::info;
 use tauri::Emitter;
 
+use crate::system_monitor;
 pub use commands_core::{SystemInfo, UpdateInfo};
 
 #[tauri::command]
 pub fn get_system_info() -> SystemInfo {
     commands_core::get_system_info()
+}
+
+// ============================================================================
+// System Data Commands
+// ============================================================================
+
+#[tauri::command]
+pub fn get_system_data(categories: Vec<String>) -> system_monitor::SystemData {
+    let valid = commands_core::validate_system_categories(&categories);
+    system_monitor::collect_system_data(&valid)
+}
+
+#[tauri::command]
+pub fn subscribe_system_data(categories: Vec<String>) {
+    let valid = commands_core::validate_system_categories(&categories);
+    system_monitor::set_poll_categories(valid);
 }
 
 // ============================================================================

@@ -26,6 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Linux deps are required for Tauri compilation on Ubuntu CI runners,
+      # even though the app only targets Windows for release builds.
       - name: Install system dependencies
         run: |
           sudo apt-get update

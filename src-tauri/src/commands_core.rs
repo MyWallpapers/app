@@ -43,6 +43,21 @@ pub fn get_system_info() -> SystemInfo {
 }
 
 // ============================================================================
+// System Data Categories
+// ============================================================================
+
+const VALID_SYSTEM_CATEGORIES: &[&str] = &["cpu", "memory", "battery", "disk", "network"];
+
+/// Filter categories against the valid set.
+pub fn validate_system_categories(categories: &[String]) -> Vec<String> {
+    categories
+        .iter()
+        .filter(|c| VALID_SYSTEM_CATEGORIES.contains(&c.as_str()))
+        .cloned()
+        .collect()
+}
+
+// ============================================================================
 // Updater Endpoint Validation
 // ============================================================================
 
@@ -182,6 +197,44 @@ pub fn validate_deep_link(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- System categories validation ----
+
+    #[test]
+    fn test_validate_system_categories_filters() {
+        let input = vec![
+            "cpu".into(),
+            "memory".into(),
+            "invalid".into(),
+            "battery".into(),
+        ];
+        let result = validate_system_categories(&input);
+        assert_eq!(result, vec!["cpu", "memory", "battery"]);
+    }
+
+    #[test]
+    fn test_validate_system_categories_all_valid() {
+        let input: Vec<String> = vec![
+            "cpu".into(),
+            "memory".into(),
+            "battery".into(),
+            "disk".into(),
+            "network".into(),
+        ];
+        assert_eq!(validate_system_categories(&input).len(), 5);
+    }
+
+    #[test]
+    fn test_validate_system_categories_empty() {
+        let result = validate_system_categories(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_validate_system_categories_all_invalid() {
+        let input = vec!["foo".into(), "bar".into()];
+        assert!(validate_system_categories(&input).is_empty());
+    }
 
     // ---- Updater endpoint validation ----
 

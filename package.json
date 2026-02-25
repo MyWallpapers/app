@@ -1,7 +1,7 @@
 {
   "name": "mywallpaper-desktop",
   "version": "1.0.226",
-  "description": "MyWallpaper Desktop Application - Animated Wallpaper for Windows/macOS",
+  "description": "MyWallpaper Desktop Application - Animated Wallpaper for Windows",
   "private": true,
   "scripts": {
     "tauri": "tauri",
