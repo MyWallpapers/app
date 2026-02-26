@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.225"
+version = "1.0.226"
 dependencies = [
  "battery",
  "log",
