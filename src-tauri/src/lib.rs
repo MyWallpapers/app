@@ -4,12 +4,17 @@
 
 mod commands;
 mod commands_core;
+mod discord;
+pub mod error;
+pub mod events;
+mod media;
 mod system_monitor;
 mod tray;
 mod window_layer;
 
-use log::{error, info};
-use std::sync::LazyLock;
+use log::{error, info, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -63,7 +68,8 @@ pub fn main() {
 }
 
 fn start_with_tauri_webview() {
-    use tauri::{webview::PageLoadEvent, Emitter, Listener, Manager};
+    use events::{AppEvent, EmitAppEvent};
+    use tauri::{webview::PageLoadEvent, Listener, Manager};
 
     let app = tauri::Builder::default()
         .plugin(
@@ -95,17 +101,30 @@ fn start_with_tauri_webview() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                args.into_iter()
-                    .filter_map(|a| commands_core::validate_deep_link(&a))
-                    .for_each(|url| {
-                        let _ = window.emit("deep-link", url);
-                    });
-            }
+            args.into_iter()
+                .filter_map(|a| commands_core::validate_deep_link(&a))
+                .for_each(|url| {
+                    let _ = app.emit_app_event(&AppEvent::DeepLink { url });
+                });
         }))
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
                 let _ = webview.eval(&*MW_INIT_SCRIPT);
+            }
+            if payload.event() == PageLoadEvent::Finished {
+                // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
+                let _ = webview.eval(
+                    r#"
+                    if (!window.__MW_HEARTBEAT__) {
+                        window.__MW_HEARTBEAT__ = true;
+                        setInterval(() => {
+                            if (window.__TAURI__?.event) {
+                                window.__TAURI__.event.emit('webview-heartbeat');
+                            }
+                        }, 5000);
+                    }
+                    "#,
+                );
             }
         })
         .setup(|app| {
@@ -117,13 +136,12 @@ fn start_with_tauri_webview() {
             let deep_link_handle = handle.clone();
             app.listen("deep-link://new-url", move |event| {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
-                    if let Some(window) = deep_link_handle.get_webview_window("main") {
-                        urls.into_iter()
-                            .filter_map(|u| commands_core::validate_deep_link(&u))
-                            .for_each(|url| {
-                                let _ = window.emit("deep-link", url);
-                            });
-                    }
+                    urls.into_iter()
+                        .filter_map(|u| commands_core::validate_deep_link(&u))
+                        .for_each(|url| {
+                            let _ =
+                                deep_link_handle.emit_app_event(&AppEvent::DeepLink { url });
+                        });
                 }
             });
 
@@ -134,6 +152,40 @@ fn start_with_tauri_webview() {
             }
 
             system_monitor::start_monitor(handle.clone(), 3);
+            discord::init();
+
+            // WebView heartbeat watchdog — auto-reload if frontend stops responding
+            fn now_secs() -> u64 {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }
+            let last_heartbeat = Arc::new(AtomicU64::new(now_secs()));
+            let hb = last_heartbeat.clone();
+            handle.listen("webview-heartbeat", move |_| {
+                hb.store(now_secs(), Ordering::Relaxed);
+            });
+
+            let hb_handle = handle.clone();
+            let hb_ref = last_heartbeat.clone();
+            std::thread::spawn(move || {
+                use std::time::Duration;
+                use tauri::Manager;
+                // Grace period for initial page load
+                std::thread::sleep(Duration::from_secs(30));
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let elapsed = now_secs() - hb_ref.load(Ordering::Relaxed);
+                    if elapsed > 15 {
+                        warn!("[heartbeat] WebView unresponsive ({}s), reloading", elapsed);
+                        if let Some(w) = hb_handle.get_webview_window("main") {
+                            let _ = w.eval("window.location.reload()");
+                            hb_ref.store(now_secs(), Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
 
             Ok(())
         })
@@ -146,6 +198,11 @@ fn start_with_tauri_webview() {
             commands::restart_app,
             commands::open_oauth_in_browser,
             commands::reload_window,
+            commands::get_media_info,
+            commands::media_play_pause,
+            commands::media_next,
+            commands::media_prev,
+            commands::update_discord_presence,
             window_layer::set_desktop_icons_visible,
         ])
         .build(tauri::generate_context!())

@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static IS_SESSION_ACTIVE: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "windows")]
+static WATCHDOG_PARENT: AtomicIsize = AtomicIsize::new(0);
 
 // ==============================================================================
 // Public API
@@ -31,7 +35,7 @@ pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
 
 #[tauri::command]
 #[allow(unused_variables)]
-pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
+pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
@@ -113,14 +117,15 @@ struct DesktopDetection {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_desktop() -> Result<DesktopDetection, String> {
+fn detect_desktop() -> Result<DesktopDetection, crate::error::AppError> {
+    use crate::error::AppError;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman.".to_string())?;
+            .map_err(|_| AppError::WindowLayer("Could not find Progman".into()))?;
 
         let mut explorer_pid: u32 = 0;
         GetWindowThreadProcessId(progman, Some(&mut explorer_pid));
@@ -400,11 +405,11 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 // ==============================================================================
 
 #[cfg(target_os = "windows")]
-fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<()> {
     use windows::Win32::Foundation::HWND;
 
     let _ = window.set_ignore_cursor_events(false);
-    let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
+    let our_hwnd_raw = window.hwnd()?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
 
     let detection = detect_desktop()?;
@@ -513,6 +518,42 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     });
 
     mouse_hook::start_hook_thread();
+
+    // Zombie window watchdog: re-detects desktop if parent HWND becomes stale
+    WATCHDOG_PARENT.store(detection.target_parent.0 as isize, Ordering::SeqCst);
+    let watchdog_our = our_hwnd.0 as isize;
+    std::thread::spawn(move || {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let parent_raw = WATCHDOG_PARENT.load(Ordering::SeqCst);
+            if parent_raw == 0 {
+                continue;
+            }
+            unsafe {
+                if !IsWindow(HWND(parent_raw as *mut _)).as_bool() {
+                    info!("[watchdog] Parent HWND stale, re-detecting desktop...");
+                    match detect_desktop() {
+                        Ok(d) => {
+                            mouse_hook::set_target_parent_hwnd(d.target_parent.0 as isize);
+                            mouse_hook::set_progman_hwnd(d.progman.0 as isize);
+                            mouse_hook::set_explorer_pid(d.explorer_pid);
+                            if !d.syslistview.is_invalid() {
+                                mouse_hook::set_syslistview_hwnd(d.syslistview.0 as isize);
+                            }
+                            apply_injection(HWND(watchdog_our as *mut _), &d);
+                            WATCHDOG_PARENT
+                                .store(d.target_parent.0 as isize, Ordering::SeqCst);
+                            info!("[watchdog] Re-injection done");
+                        }
+                        Err(e) => error!("[watchdog] Re-detection failed: {}", e),
+                    }
+                }
+            }
+        }
+    });
+
     Ok(())
 }
 
@@ -638,6 +679,26 @@ pub mod mouse_hook {
             }
             return LRESULT(0);
         }
+        // WTS session lock/unlock notifications
+        const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+        const WTS_SESSION_LOCK: u32 = 0x7;
+        const WTS_SESSION_UNLOCK: u32 = 0x8;
+
+        if msg == WM_WTSSESSION_CHANGE {
+            match wp.0 as u32 {
+                WTS_SESSION_LOCK => {
+                    crate::window_layer::IS_SESSION_ACTIVE.store(false, Ordering::SeqCst);
+                    log::info!("[session] Screen locked, hook paused");
+                }
+                WTS_SESSION_UNLOCK => {
+                    crate::window_layer::IS_SESSION_ACTIVE.store(true, Ordering::SeqCst);
+                    log::info!("[session] Screen unlocked, hook resumed");
+                }
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+
         DefWindowProcW(hwnd, msg, wp, lp)
     }
 
@@ -665,6 +726,12 @@ pub mod mouse_hook {
                 None,
             ) {
                 DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+
+                // Register for session lock/unlock notifications
+                use windows::Win32::System::RemoteDesktop::{
+                    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+                };
+                let _ = WTSRegisterSessionNotification(h, NOTIFY_FOR_THIS_SESSION.0 as u32);
             }
         }
     }
@@ -839,6 +906,11 @@ pub mod mouse_hook {
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
 
                 if code < 0 || wv_raw == 0 {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // Pause forwarding while the session is locked
+                if !crate::window_layer::IS_SESSION_ACTIVE.load(Ordering::Relaxed) {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 

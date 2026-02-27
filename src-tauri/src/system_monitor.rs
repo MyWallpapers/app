@@ -28,6 +28,8 @@ pub struct SystemData {
     pub disk: Option<Vec<DiskInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<Vec<NetworkInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media::MediaInfo>,
 }
 
 #[typeshare]
@@ -115,6 +117,7 @@ pub fn collect_system_data(categories: &[String]) -> SystemData {
     let needs_disk = categories.iter().any(|c| c == "disk");
     let needs_network = categories.iter().any(|c| c == "network");
     let needs_battery = categories.iter().any(|c| c == "battery");
+    let needs_media = categories.iter().any(|c| c == "media");
 
     if needs_cpu || needs_memory {
         let mut sys = System::new();
@@ -185,6 +188,10 @@ pub fn collect_system_data(categories: &[String]) -> SystemData {
         data.battery = collect_battery_info();
     }
 
+    if needs_media {
+        data.media = crate::media::get_media_info().ok();
+    }
+
     data
 }
 
@@ -232,6 +239,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
     let needs_disk = categories.iter().any(|c| c == "disk");
     let needs_network = categories.iter().any(|c| c == "network");
     let needs_battery = categories.iter().any(|c| c == "battery");
+    let needs_media = categories.iter().any(|c| c == "media");
 
     if needs_cpu {
         sys.refresh_cpu_usage();
@@ -296,6 +304,10 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         data.battery = collect_battery_info();
     }
 
+    if needs_media {
+        data.media = crate::media::get_media_info().ok();
+    }
+
     data
 }
 
@@ -313,7 +325,7 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
     );
 
     std::thread::spawn(move || {
-        use tauri::Emitter;
+        use crate::events::{AppEvent, EmitAppEvent};
 
         let mut sys = sysinfo::System::new();
         // Initial CPU refresh so the first poll has a baseline
@@ -332,7 +344,8 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
 
             let data = collect_with_system(&mut sys, &categories);
 
-            if let Err(e) = app_handle.emit("system-data-update", &data) {
+            let event = AppEvent::SystemDataUpdate(Box::new(data));
+            if let Err(e) = app_handle.emit_app_event(&event) {
                 error!("[system_monitor] Failed to emit event: {}", e);
             }
 

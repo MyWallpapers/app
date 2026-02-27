@@ -52,6 +52,11 @@ jobs:
       - name: Tests
         run: cd src-tauri && cargo test --all
 
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked
+          cd src-tauri && cargo audit
+
   bump-version:
     runs-on: ubuntu-latest
     permissions:

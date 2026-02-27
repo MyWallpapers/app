@@ -3,6 +3,7 @@
 //! These functions contain the actual business logic, free of `tauri::` types.
 //! Tauri command wrappers in `commands.rs` call into these.
 
+use crate::error::AppError;
 use serde::Serialize;
 use typeshare::typeshare;
 
@@ -46,7 +47,7 @@ pub fn get_system_info() -> SystemInfo {
 // System Data Categories
 // ============================================================================
 
-const VALID_SYSTEM_CATEGORIES: &[&str] = &["cpu", "memory", "battery", "disk", "network"];
+const VALID_SYSTEM_CATEGORIES: &[&str] = &["cpu", "memory", "battery", "disk", "network", "media"];
 
 /// Filter categories against the valid set.
 pub fn validate_system_categories(categories: &[String]) -> Vec<String> {
@@ -65,16 +66,21 @@ const ALLOWED_UPDATER_HOST: &str = "github.com";
 const ALLOWED_UPDATER_PATH_PREFIX: &str = "/MyWallpapers/app/releases/download/";
 
 /// Validate that an updater endpoint URL points to our GitHub releases.
-pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(endpoint).map_err(|_| "Invalid endpoint URL".to_string())?;
+pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), AppError> {
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|_| AppError::Validation("Invalid endpoint URL".into()))?;
     if parsed.scheme() != "https" {
-        return Err("Endpoint must use HTTPS".into());
+        return Err(AppError::Validation("Endpoint must use HTTPS".into()));
     }
     if parsed.host_str() != Some(ALLOWED_UPDATER_HOST) {
-        return Err("Endpoint must be on github.com".into());
+        return Err(AppError::Validation(
+            "Endpoint must be on github.com".into(),
+        ));
     }
     if !parsed.path().starts_with(ALLOWED_UPDATER_PATH_PREFIX) {
-        return Err("Endpoint must point to MyWallpapers/app releases".into());
+        return Err(AppError::Validation(
+            "Endpoint must point to MyWallpapers/app releases".into(),
+        ));
     }
     Ok(())
 }
@@ -86,40 +92,55 @@ pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), String> {
 /// Validate an OAuth URL:
 /// - Must be valid HTTPS, or HTTP only for localhost/127.0.0.1
 /// - Blocks private/internal IP ranges (SSRF prevention)
-pub fn validate_oauth_url(url_str: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url_str).map_err(|_| "Invalid URL".to_string())?;
+pub fn validate_oauth_url(url_str: &str) -> Result<(), AppError> {
+    let parsed =
+        url::Url::parse(url_str).map_err(|_| AppError::Validation("Invalid URL".into()))?;
 
     match parsed.scheme() {
         "https" => {}
         "http" => {
             let host = parsed.host_str().unwrap_or("");
             if host != "localhost" && host != "127.0.0.1" && host != "[::1]" {
-                return Err("HTTP is only allowed for localhost".into());
+                return Err(AppError::Validation(
+                    "HTTP is only allowed for localhost".into(),
+                ));
             }
             return Ok(());
         }
-        _ => return Err("URL must use https:// (or http:// for localhost)".into()),
+        _ => {
+            return Err(AppError::Validation(
+                "URL must use https:// (or http:// for localhost)".into(),
+            ))
+        }
     }
 
     // Block private/internal IPs via HTTPS (SSRF)
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
             if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
-                return Err("HTTPS to private/internal IPs is not allowed".into());
+                return Err(AppError::Validation(
+                    "HTTPS to private/internal IPs is not allowed".into(),
+                ));
             }
         }
         Some(url::Host::Ipv6(ip)) => {
             if ip.is_loopback() || ip.is_unspecified() {
-                return Err("HTTPS to private/internal IPs is not allowed".into());
+                return Err(AppError::Validation(
+                    "HTTPS to private/internal IPs is not allowed".into(),
+                ));
             }
             let segs = ip.segments();
             // fc00::/7 — unique local
             if segs[0] & 0xfe00 == 0xfc00 {
-                return Err("HTTPS to private/internal IPs is not allowed".into());
+                return Err(AppError::Validation(
+                    "HTTPS to private/internal IPs is not allowed".into(),
+                ));
             }
             // fe80::/10 — link-local
             if segs[0] & 0xffc0 == 0xfe80 {
-                return Err("HTTPS to private/internal IPs is not allowed".into());
+                return Err(AppError::Validation(
+                    "HTTPS to private/internal IPs is not allowed".into(),
+                ));
             }
             // ::ffff:0:0/96 — IPv4-mapped (check underlying IPv4)
             if let Some(ipv4) = ip.to_ipv4_mapped() {
@@ -128,7 +149,9 @@ pub fn validate_oauth_url(url_str: &str) -> Result<(), String> {
                     || ipv4.is_link_local()
                     || ipv4.is_unspecified()
                 {
-                    return Err("HTTPS to private/internal IPs is not allowed".into());
+                    return Err(AppError::Validation(
+                        "HTTPS to private/internal IPs is not allowed".into(),
+                    ));
                 }
             }
         }
@@ -144,28 +167,37 @@ pub fn validate_oauth_url(url_str: &str) -> Result<(), String> {
 
 /// Reject updates that would downgrade to an older version.
 /// Compares semver-style version strings (major.minor.patch).
-pub fn validate_update_version(current: &str, candidate: &str) -> Result<(), String> {
-    let parse = |v: &str| -> Result<(u32, u32, u32), String> {
+pub fn validate_update_version(current: &str, candidate: &str) -> Result<(), AppError> {
+    let parse = |v: &str| -> Result<(u32, u32, u32), AppError> {
         let v = v.trim_start_matches('v');
         // Strip any pre-release suffix (e.g., "1.0.0-dev")
         let v = v.split('-').next().unwrap_or(v);
         let parts: Vec<&str> = v.split('.').collect();
         if parts.len() != 3 {
-            return Err(format!("Invalid version format: {}", v));
+            return Err(AppError::Validation(format!(
+                "Invalid version format: {}",
+                v
+            )));
         }
         Ok((
-            parts[0].parse().map_err(|_| "Invalid major version")?,
-            parts[1].parse().map_err(|_| "Invalid minor version")?,
-            parts[2].parse().map_err(|_| "Invalid patch version")?,
+            parts[0]
+                .parse()
+                .map_err(|_| AppError::Validation("Invalid major version".into()))?,
+            parts[1]
+                .parse()
+                .map_err(|_| AppError::Validation("Invalid minor version".into()))?,
+            parts[2]
+                .parse()
+                .map_err(|_| AppError::Validation("Invalid patch version".into()))?,
         ))
     };
     let current = parse(current)?;
     let candidate = parse(candidate)?;
     if candidate < current {
-        return Err(format!(
+        return Err(AppError::Validation(format!(
             "Refusing downgrade from {}.{}.{} to {}.{}.{}",
             current.0, current.1, current.2, candidate.0, candidate.1, candidate.2
-        ));
+        )));
     }
     Ok(())
 }
@@ -220,8 +252,9 @@ mod tests {
             "battery".into(),
             "disk".into(),
             "network".into(),
+            "media".into(),
         ];
-        assert_eq!(validate_system_categories(&input).len(), 5);
+        assert_eq!(validate_system_categories(&input).len(), 6);
     }
 
     #[test]

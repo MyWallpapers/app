@@ -31,6 +31,8 @@ os_info = "3"
 typeshare = "1.0"
 sysinfo = "0.33"
 battery = "0.7"
+thiserror = "2"
+discord-rich-presence = "0.2"
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies.windows]
@@ -50,6 +52,10 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Shell",
+    "Win32_System_RemoteDesktop",
+    "Media_Control",
+    "Foundation",
+    "Storage_Streams",
 ]
 
 # Direct dependency on wry for WebViewExtWindows + composition_controller access
