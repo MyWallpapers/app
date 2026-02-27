@@ -60,8 +60,14 @@ pub fn get_media_info() -> AppResult<MediaInfo> {
 
     let (title, artist, album) = match props {
         Some(ref p) => (
-            p.Title().ok().map(|s| s.to_string()).filter(|s| !s.is_empty()),
-            p.Artist().ok().map(|s| s.to_string()).filter(|s| !s.is_empty()),
+            p.Title()
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty()),
+            p.Artist()
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty()),
             p.AlbumTitle()
                 .ok()
                 .map(|s| s.to_string())

@@ -13,28 +13,26 @@ static CLIENT: Mutex<Option<DiscordIpcClient>> = Mutex::new(None);
 
 /// Connect to Discord RPC. Fails silently if Discord is not running.
 pub fn init() {
-    std::thread::spawn(|| {
-        match DiscordIpcClient::new(DISCORD_APP_ID) {
-            Ok(mut client) => {
-                if client.connect().is_ok() {
-                    let activity = activity::Activity::new()
-                        .state("Animated Wallpaper")
-                        .details("Using MyWallpaper")
-                        .assets(
-                            activity::Assets::new()
-                                .large_image("logo")
-                                .large_text("MyWallpaper Desktop"),
-                        );
-                    let _ = client.set_activity(activity);
-                    *CLIENT.lock().unwrap() = Some(client);
-                    info!("[discord] Rich Presence connected");
-                } else {
-                    warn!("[discord] Discord not running, skipping Rich Presence");
-                }
+    std::thread::spawn(|| match DiscordIpcClient::new(DISCORD_APP_ID) {
+        Ok(mut client) => {
+            if client.connect().is_ok() {
+                let activity = activity::Activity::new()
+                    .state("Animated Wallpaper")
+                    .details("Using MyWallpaper")
+                    .assets(
+                        activity::Assets::new()
+                            .large_image("logo")
+                            .large_text("MyWallpaper Desktop"),
+                    );
+                let _ = client.set_activity(activity);
+                *CLIENT.lock().unwrap() = Some(client);
+                info!("[discord] Rich Presence connected");
+            } else {
+                warn!("[discord] Discord not running, skipping Rich Presence");
             }
-            Err(e) => {
-                warn!("[discord] Failed to create IPC client: {}", e);
-            }
+        }
+        Err(e) => {
+            warn!("[discord] Failed to create IPC client: {}", e);
         }
     });
 }

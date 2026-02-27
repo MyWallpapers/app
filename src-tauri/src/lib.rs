@@ -139,8 +139,7 @@ fn start_with_tauri_webview() {
                     urls.into_iter()
                         .filter_map(|u| commands_core::validate_deep_link(&u))
                         .for_each(|url| {
-                            let _ =
-                                deep_link_handle.emit_app_event(&AppEvent::DeepLink { url });
+                            let _ = deep_link_handle.emit_app_event(&AppEvent::DeepLink { url });
                         });
                 }
             });

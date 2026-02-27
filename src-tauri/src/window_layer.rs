@@ -543,8 +543,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
                                 mouse_hook::set_syslistview_hwnd(d.syslistview.0 as isize);
                             }
                             apply_injection(HWND(watchdog_our as *mut _), &d);
-                            WATCHDOG_PARENT
-                                .store(d.target_parent.0 as isize, Ordering::SeqCst);
+                            WATCHDOG_PARENT.store(d.target_parent.0 as isize, Ordering::SeqCst);
                             info!("[watchdog] Re-injection done");
                         }
                         Err(e) => error!("[watchdog] Re-detection failed: {}", e),
