@@ -112,6 +112,10 @@ struct DesktopDetection {
     explorer_pid: u32,
     target_parent: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
+    /// Sibling window that must stay IN FRONT of target_parent (Z-order).
+    /// Win11 24H2+: SHELLDLL_DefView (child of Progman).
+    /// Legacy: WorkerW that contains SHELLDLL_DefView.
+    zorder_anchor: windows::Win32::Foundation::HWND,
     v_width: i32,
     v_height: i32,
 }
@@ -200,6 +204,18 @@ fn detect_desktop() -> Result<DesktopDetection, crate::error::AppError> {
             shell_for_slv = data.sv;
         }
 
+        // Compute Z-order anchor: the sibling that must stay IN FRONT
+        // of target_parent so WindowFromPoint returns SysListView32.
+        let zorder_anchor = if !shell_view.is_invalid() {
+            // Win11 24H2+: SHELLDLL_DefView is a direct sibling of WorkerW
+            shell_view
+        } else if !shell_for_slv.is_invalid() {
+            // Legacy: SHELLDLL_DefView is inside WorkerW A; get WorkerW A
+            GetParent(shell_for_slv).unwrap_or_default()
+        } else {
+            HWND::default()
+        };
+
         if target_parent.is_invalid() {
             target_parent = progman;
         }
@@ -272,6 +288,7 @@ fn detect_desktop() -> Result<DesktopDetection, crate::error::AppError> {
             explorer_pid,
             target_parent,
             syslistview,
+            zorder_anchor,
             v_width: width,
             v_height: height,
         })
@@ -377,8 +394,8 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             GetStockObject(BLACK_BRUSH).0 as isize,
         );
 
-        // 5. Reparent into WorkerW
-        let _ = ShowWindow(detection.target_parent, SW_SHOW);
+        // 5. Reparent into WorkerW (SW_SHOWNA preserves Z-order)
+        let _ = ShowWindow(detection.target_parent, SW_SHOWNA);
         let _ = SetParent(our_hwnd, detection.target_parent);
 
         // 6. Size to full monitor + force frame recalc
@@ -392,6 +409,23 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
             SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER,
         );
         let _ = ShowWindow(our_hwnd, SW_SHOW);
+
+        // 7. Ensure WorkerW is BEHIND the icon layer so WindowFromPoint
+        //    returns SysListView32, enabling fully native icon interactions
+        //    (drag & drop, double-click, context menus, selection rectangle).
+        if !detection.zorder_anchor.is_invalid()
+            && detection.zorder_anchor != detection.target_parent
+        {
+            let _ = SetWindowPos(
+                detection.target_parent,
+                detection.zorder_anchor,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
 
         info!(
             "[apply_injection] Done. Parent=0x{:X}, Size={}x{}",
