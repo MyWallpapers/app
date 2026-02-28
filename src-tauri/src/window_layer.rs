@@ -625,6 +625,7 @@ pub mod mouse_hook {
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[allow(dead_code)]
     static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -1136,9 +1137,9 @@ pub mod mouse_hook {
             }
 
             /// Attach/detach Chrome_RWHH thread ↔ explorer thread input queues.
-            /// When attached, they share the key-state table. This ensures
-            /// GetKeyState(VK_LBUTTON) on explorer's thread returns "pressed"
-            /// even though the hardware WM_LBUTTONDOWN was delivered to Chrome_RWHH.
+            /// Currently unused: full-consume approach makes AttachThreadInput
+            /// unnecessary. Kept for potential future OLE drag-to-external use.
+            #[allow(dead_code)]
             unsafe fn set_thread_attach(slv_raw: isize, attach: bool) {
                 extern "system" {
                     fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
@@ -1185,39 +1186,24 @@ pub mod mouse_hook {
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
-                // ── Lazy detach: threads still attached from a completed drag ──
-                // We detach here (on the next mouse event) instead of immediately
-                // on LBUTTONUP, because DoDragDrop's modal loop still needs the
-                // shared key-state table to detect button release via
-                // GetKeyState(VK_LBUTTON) → QueryContinueDrag.
-                if THREADS_ATTACHED.load(Ordering::Relaxed) && !NATIVE_DRAG.load(Ordering::Relaxed)
-                {
-                    set_thread_attach(slv_raw, false);
-                }
-
                 // ── Active native drag: forward to SysListView32, skip webview ──
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        // Don't detach threads here — lazy detach on next event.
                     }
                     // Post ALL events to SysListView32 (down/move/up)
                     // so it receives the complete drag gesture.
                     if slv_raw != 0 {
                         post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                     }
-                    // Consume WM_MOUSEMOVE: Chrome_RWHH must NOT receive mouse
-                    // movement during icon drag. When Chrome gets WM_MOUSEMOVE
-                    // via CallNextHookEx, its compositor calls SetCapture and
-                    // steals the drag gesture from SysListView32's DragDetect /
-                    // DoDragDrop. By consuming, Chrome stays blind to movement
-                    // while SysListView32 gets posted WM_MOUSEMOVE from above.
-                    // Button events still need CallNextHookEx to update the
-                    // shared key-state table (via AttachThreadInput).
-                    if msg == WM_MOUSEMOVE {
-                        return LRESULT(1);
-                    }
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                    // Consume ALL events: Chrome_RWHH must not receive ANY mouse
+                    // input during icon drag. If Chrome gets even WM_LBUTTONDOWN
+                    // via CallNextHookEx, it calls SetCapture + SetFocus, which
+                    // fights with SysListView32's own capture/focus and prevents
+                    // drag detection. By consuming everything (LRESULT(1)),
+                    // Chrome is completely blind and SysListView32 handles the
+                    // entire gesture via PostMessageW above.
+                    return LRESULT(1);
                 }
 
                 // ── Not over desktop: pass through ──
@@ -1237,19 +1223,15 @@ pub mod mouse_hook {
 
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
-                        // Attach Chrome ↔ explorer thread input so they share
-                        // GetKeyState. DoDragDrop → QueryContinueDrag checks
-                        // GetKeyState(VK_LBUTTON): must see "pressed".
-                        set_thread_attach(slv_raw, true);
                         log::info!(
                             "[hook] Icon hit → NATIVE_DRAG, pt=({},{})",
                             info_hook.pt.x,
                             info_hook.pt.y,
                         );
-                        // Post to SysListView32 (hardware goes to Chrome_RWHH)
                         post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                        // Skip webview forward. CallNextHookEx for key state.
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                        // Consume: Chrome must not see the click (SetCapture/
+                        // SetFocus would steal the gesture from SysListView32).
+                        return LRESULT(1);
                     }
                 }
 
