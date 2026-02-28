@@ -578,8 +578,6 @@ pub mod mouse_hook {
     const MK_NONE: i32 = 0x0;
     const MK_LBUTTON: i32 = 0x0001;
     const MK_RBUTTON: i32 = 0x0002;
-    const MK_SHIFT: i32 = 0x0004;
-    const MK_CONTROL: i32 = 0x0008;
     const MK_MBUTTON: i32 = 0x0010;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -595,9 +593,6 @@ pub mod mouse_hook {
 
     // Cached values to avoid syscalls in hook hot path
     static OUR_PID: AtomicU32 = AtomicU32::new(0);
-    static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
-    static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -885,12 +880,8 @@ pub mod mouse_hook {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-                // Cache process ID + double-click metrics once at hook startup
+                // Cache process ID once at hook startup
                 OUR_PID.store(std::process::id(), Ordering::Relaxed);
-                use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-                DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
-                DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
-                DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
             }
 
             unsafe extern "system" fn hook_proc(
@@ -926,84 +917,9 @@ pub mod mouse_hook {
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                // Forward to SysListView32 for icon interactions + selection rectangle
-                let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-                if !slv.is_invalid() && IsWindowVisible(slv).as_bool() {
-                    let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                        ((info_hook.pt.x as i16 as u16 as u32)
-                            | ((info_hook.pt.y as i16 as u16 as u32) << 16))
-                            as isize
-                    } else {
-                        let mut slv_cp = info_hook.pt;
-                        let _ = ScreenToClient(slv, &mut slv_cp);
-                        ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16))
-                            as isize
-                    };
-
-                    let mut out_msg = msg;
-                    if msg == WM_LBUTTONDOWN {
-                        // Synthesize double-click for SysListView32.
-                        // SAFETY: WH_MOUSE_LL callbacks are serialized by Windows —
-                        // only one invocation runs at a time on this thread, so
-                        // Relaxed ordering is correct and no race can occur.
-                        static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
-                            std::sync::atomic::AtomicU32::new(0);
-                        static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
-                            std::sync::atomic::AtomicI32::new(0);
-                        static LAST_DOWN_Y: std::sync::atomic::AtomicI32 =
-                            std::sync::atomic::AtomicI32::new(0);
-
-                        let now = info_hook.time;
-                        let dt = now.saturating_sub(LAST_DOWN_TIME.load(Ordering::Relaxed));
-                        let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
-                        let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
-
-                        if dt > 0
-                            && dt <= DBLCLICK_TIME.load(Ordering::Relaxed)
-                            && dx <= DBLCLICK_CX.load(Ordering::Relaxed)
-                            && dy <= DBLCLICK_CY.load(Ordering::Relaxed)
-                        {
-                            out_msg = WM_LBUTTONDBLCLK;
-                            LAST_DOWN_TIME.store(0, Ordering::Relaxed);
-                        } else {
-                            LAST_DOWN_TIME.store(now, Ordering::Relaxed);
-                            LAST_DOWN_X.store(info_hook.pt.x, Ordering::Relaxed);
-                            LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
-                        }
-                    }
-                    // Build correct MK_* key state flags (the hook's wparam is the
-                    // message type, NOT the key state SysListView32 expects).
-                    let slv_wparam = {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                        let mut mk: u16 = 0;
-                        if out_msg == WM_LBUTTONDOWN
-                            || out_msg == WM_LBUTTONDBLCLK
-                            || GetAsyncKeyState(0x01) < 0
-                        {
-                            mk |= 0x0001; // MK_LBUTTON
-                        }
-                        if out_msg == WM_RBUTTONDOWN || GetAsyncKeyState(0x02) < 0 {
-                            mk |= 0x0002; // MK_RBUTTON
-                        }
-                        if out_msg == WM_MBUTTONDOWN || GetAsyncKeyState(0x04) < 0 {
-                            mk |= 0x0010; // MK_MBUTTON
-                        }
-                        if GetAsyncKeyState(0x10) < 0 {
-                            mk |= 0x0004; // MK_SHIFT
-                        }
-                        if GetAsyncKeyState(0x11) < 0 {
-                            mk |= 0x0008; // MK_CONTROL
-                        }
-                        if out_msg == WM_MOUSEWHEEL || out_msg == WM_MOUSEHWHEEL {
-                            let delta = (info_hook.mouseData >> 16) as u16;
-                            WPARAM(((delta as usize) << 16) | mk as usize)
-                        } else {
-                            WPARAM(mk as usize)
-                        }
-                    };
-                    let _ = PostMessageW(slv, out_msg, slv_wparam, LPARAM(lp));
-                }
-
+                // CallNextHookEx lets the native message continue to SysListView32,
+                // preserving double-click detection, drag & drop, context menus,
+                // and all other native desktop icon behaviors without duplication.
                 CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
