@@ -1185,21 +1185,38 @@ pub mod mouse_hook {
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
+                // ── Lazy detach: threads still attached from a completed drag ──
+                // We detach here (on the next mouse event) instead of immediately
+                // on LBUTTONUP, because DoDragDrop's modal loop still needs the
+                // shared key-state table to detect button release via
+                // GetKeyState(VK_LBUTTON) → QueryContinueDrag.
+                if THREADS_ATTACHED.load(Ordering::Relaxed) && !NATIVE_DRAG.load(Ordering::Relaxed)
+                {
+                    set_thread_attach(slv_raw, false);
+                }
+
                 // ── Active native drag: forward to SysListView32, skip webview ──
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        // Detach thread input queues
-                        if THREADS_ATTACHED.load(Ordering::Relaxed) {
-                            set_thread_attach(slv_raw, false);
-                        }
+                        // Don't detach threads here — lazy detach on next event.
                     }
                     // Post ALL events to SysListView32 (down/move/up)
                     // so it receives the complete drag gesture.
                     if slv_raw != 0 {
                         post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                     }
-                    // Skip webview forward. CallNextHookEx preserves key state.
+                    // Consume WM_MOUSEMOVE: Chrome_RWHH must NOT receive mouse
+                    // movement during icon drag. When Chrome gets WM_MOUSEMOVE
+                    // via CallNextHookEx, its compositor calls SetCapture and
+                    // steals the drag gesture from SysListView32's DragDetect /
+                    // DoDragDrop. By consuming, Chrome stays blind to movement
+                    // while SysListView32 gets posted WM_MOUSEMOVE from above.
+                    // Button events still need CallNextHookEx to update the
+                    // shared key-state table (via AttachThreadInput).
+                    if msg == WM_MOUSEMOVE {
+                        return LRESULT(1);
+                    }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
