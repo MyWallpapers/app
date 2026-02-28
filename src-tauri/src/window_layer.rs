@@ -908,7 +908,10 @@ pub mod mouse_hook {
         let mut pid = 0u32;
         GetWindowThreadProcessId(slv, Some(&mut pid));
         if pid == 0 {
-            log::info!("[hit_test] GetWindowThreadProcessId returned pid=0 for slv=0x{:X}", slv.0 as isize);
+            log::info!(
+                "[hit_test] GetWindowThreadProcessId returned pid=0 for slv=0x{:X}",
+                slv.0 as isize
+            );
             return false;
         }
 
@@ -1056,8 +1059,7 @@ pub mod mouse_hook {
                 } else {
                     let mut slv_cp = info_hook.pt;
                     let _ = ScreenToClient(slv, &mut slv_cp);
-                    ((slv_cp.x as i16 as u16 as u32)
-                        | ((slv_cp.y as i16 as u16 as u32) << 16))
+                    ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16))
                         as isize
                 };
 
@@ -1196,7 +1198,8 @@ pub mod mouse_hook {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
                         log::info!(
                             "[hook] SysListView32 direct hit → NATIVE_DRAG, pt=({},{})",
-                            info_hook.pt.x, info_hook.pt.y,
+                            info_hook.pt.x,
+                            info_hook.pt.y,
                         );
                     }
                     // Native delivery will reach SysListView32 directly via CallNextHookEx.
@@ -1227,7 +1230,9 @@ pub mod mouse_hook {
                         post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     } else {
-                        log::info!("[hook] LBUTTONDOWN on desktop, hit_test_icon=false → wallpaper mode");
+                        log::info!(
+                            "[hook] LBUTTONDOWN on desktop, hit_test_icon=false → wallpaper mode"
+                        );
                     }
                 }
 
