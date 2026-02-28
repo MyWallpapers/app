@@ -624,6 +624,7 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
+    static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     // Cached values to avoid syscalls in hook hot path
     static OUR_PID: AtomicU32 = AtomicU32::new(0);
@@ -807,9 +808,13 @@ pub mod mouse_hook {
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
         let pm = HWND(PROGMAN_HWND.load(Ordering::Relaxed) as *mut _);
         let dc = HWND(DESKTOP_CORE_HWND.load(Ordering::Relaxed) as *mut _);
+        let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
 
-        // Fast path: known HWNDs (includes cached desktop CoreWindow)
+        // Fast path: known HWNDs (includes cached desktop CoreWindow + SysListView32)
         if !rwhh.is_invalid() && hwnd_under == rwhh {
+            return true;
+        }
+        if !slv.is_invalid() && hwnd_under == slv {
             return true;
         }
         if !dc.is_invalid() && hwnd_under == dc {
@@ -819,6 +824,10 @@ pub mod mouse_hook {
             return true;
         }
         if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() {
+            return true;
+        }
+        // Also check if hwnd_under is a child of the target parent (WorkerW)
+        if !tp.is_invalid() && IsChild(tp, hwnd_under).as_bool() {
             return true;
         }
 
@@ -856,6 +865,114 @@ pub mod mouse_hook {
             }
         }
         false
+    }
+
+    /// Check if screen point is over a desktop icon via LVM_HITTEST.
+    /// Cross-process: allocates the LVHITTESTINFO struct in explorer.exe's
+    /// address space so SysListView32 can read the pointer from SendMessage.
+    unsafe fn hit_test_icon(slv: HWND, screen_pt: &windows::Win32::Foundation::POINT) -> bool {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+        use windows::Win32::System::Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+
+        let mut pt = *screen_pt;
+        let _ = ScreenToClient(slv, &mut pt);
+
+        const LVM_FIRST: u32 = 0x1000;
+        const LVM_HITTEST: u32 = LVM_FIRST + 18;
+
+        #[repr(C)]
+        struct LVHITTESTINFO {
+            pt: windows::Win32::Foundation::POINT,
+            flags: u32,
+            i_item: i32,
+            i_sub_item: i32,
+            i_group: i32,
+        }
+
+        let ht = LVHITTESTINFO {
+            pt,
+            flags: 0,
+            i_item: -1,
+            i_sub_item: 0,
+            i_group: 0,
+        };
+
+        // Open explorer.exe to allocate memory in its address space
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(slv, Some(&mut pid));
+        if pid == 0 {
+            log::info!("[hit_test] GetWindowThreadProcessId returned pid=0 for slv=0x{:X}", slv.0 as isize);
+            return false;
+        }
+
+        let proc = match OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            false,
+            pid,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                log::info!("[hit_test] OpenProcess failed for pid={}: {}", pid, e);
+                return false;
+            }
+        };
+
+        let size = std::mem::size_of::<LVHITTESTINFO>();
+        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if remote.is_null() {
+            log::info!("[hit_test] VirtualAllocEx failed (null), pid={}", pid);
+            let _ = CloseHandle(proc);
+            return false;
+        }
+
+        // Write our struct into explorer's memory
+        if WriteProcessMemory(proc, remote, &ht as *const _ as _, size, None).is_err() {
+            log::info!("[hit_test] WriteProcessMemory failed, pid={}", pid);
+            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+            let _ = CloseHandle(proc);
+            return false;
+        }
+
+        // Send hit test (explorer reads the remote pointer)
+        let mut msg_result: usize = 0;
+        let send_ok = SendMessageTimeoutW(
+            slv,
+            LVM_HITTEST,
+            WPARAM(0),
+            LPARAM(remote as isize),
+            SMTO_ABORTIFHUNG,
+            100, // 100ms — generous for cross-process round-trip
+            Some(&mut msg_result),
+        );
+
+        // Read back the result
+        let mut ht_out = LVHITTESTINFO {
+            pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+            flags: 0,
+            i_item: -1,
+            i_sub_item: 0,
+            i_group: 0,
+        };
+        let read_ok = ReadProcessMemory(proc, remote, &mut ht_out as *mut _ as _, size, None);
+
+        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        let _ = CloseHandle(proc);
+
+        log::info!(
+            "[hit_test] screen=({},{}) client=({},{}) send_ok={} msg_result={} read_ok={} i_item={} flags=0x{:X}",
+            screen_pt.x, screen_pt.y, pt.x, pt.y,
+            send_ok.is_ok(), msg_result, read_ok.is_ok(),
+            ht_out.i_item, ht_out.flags,
+        );
+
+        ht_out.i_item >= 0
     }
 
     #[inline]
@@ -924,12 +1041,92 @@ pub mod mouse_hook {
                 DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
             }
 
+            /// Post a mouse event to SysListView32, with double-click synthesis and key state.
+            unsafe fn post_to_slv(slv: HWND, msg: u32, info_hook: &MSLLHOOKSTRUCT) {
+                use windows::Win32::Graphics::Gdi::ScreenToClient;
+
+                if !IsWindowVisible(slv).as_bool() {
+                    return;
+                }
+
+                let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                    ((info_hook.pt.x as i16 as u16 as u32)
+                        | ((info_hook.pt.y as i16 as u16 as u32) << 16))
+                        as isize
+                } else {
+                    let mut slv_cp = info_hook.pt;
+                    let _ = ScreenToClient(slv, &mut slv_cp);
+                    ((slv_cp.x as i16 as u16 as u32)
+                        | ((slv_cp.y as i16 as u16 as u32) << 16))
+                        as isize
+                };
+
+                // Synthesize double-click when forwarding via PostMessageW
+                // (PostMessage bypasses native double-click detection).
+                let mut out_msg = msg;
+                if msg == WM_LBUTTONDOWN {
+                    static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(0);
+                    static LAST_DOWN_Y: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(0);
+
+                    let now = info_hook.time;
+                    let dt = now.saturating_sub(LAST_DOWN_TIME.load(Ordering::Relaxed));
+                    let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
+                    let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
+
+                    if dt > 0
+                        && dt <= DBLCLICK_TIME.load(Ordering::Relaxed)
+                        && dx <= DBLCLICK_CX.load(Ordering::Relaxed)
+                        && dy <= DBLCLICK_CY.load(Ordering::Relaxed)
+                    {
+                        out_msg = WM_LBUTTONDBLCLK;
+                        LAST_DOWN_TIME.store(0, Ordering::Relaxed);
+                    } else {
+                        LAST_DOWN_TIME.store(now, Ordering::Relaxed);
+                        LAST_DOWN_X.store(info_hook.pt.x, Ordering::Relaxed);
+                        LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
+                    }
+                }
+
+                let slv_wparam = {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                    let mut mk: u16 = 0;
+                    if out_msg == WM_LBUTTONDOWN
+                        || out_msg == WM_LBUTTONDBLCLK
+                        || GetAsyncKeyState(0x01) < 0
+                    {
+                        mk |= 0x0001; // MK_LBUTTON
+                    }
+                    if out_msg == WM_RBUTTONDOWN || GetAsyncKeyState(0x02) < 0 {
+                        mk |= 0x0002; // MK_RBUTTON
+                    }
+                    if out_msg == WM_MBUTTONDOWN || GetAsyncKeyState(0x04) < 0 {
+                        mk |= 0x0010; // MK_MBUTTON
+                    }
+                    if GetAsyncKeyState(0x10) < 0 {
+                        mk |= 0x0004; // MK_SHIFT
+                    }
+                    if GetAsyncKeyState(0x11) < 0 {
+                        mk |= 0x0008; // MK_CONTROL
+                    }
+                    if out_msg == WM_MOUSEWHEEL || out_msg == WM_MOUSEHWHEEL {
+                        let delta = (info_hook.mouseData >> 16) as u16;
+                        WPARAM(((delta as usize) << 16) | mk as usize)
+                    } else {
+                        WPARAM(mk as usize)
+                    }
+                };
+                let _ = PostMessageW(slv, out_msg, slv_wparam, LPARAM(lp));
+            }
+
             unsafe extern "system" fn hook_proc(
                 code: i32,
                 wparam: WPARAM,
                 lparam: LPARAM,
             ) -> LRESULT {
-                // Relaxed is correct: stored on this same thread before SetWindowsHookExW returned
                 let hook_h = HHOOK(
                     crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _,
                 );
@@ -939,106 +1136,110 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // Pause forwarding while the session is locked
                 if !crate::window_layer::IS_SESSION_ACTIVE.load(Ordering::Relaxed) {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
                 let info_hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
                 let hwnd_under = WindowFromPoint(info_hook.pt);
+                let msg = wparam.0 as u32;
+                let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
+                // ── Check if WindowFromPoint hit SysListView32 directly ──
+                let hwnd_is_slv = slv_raw != 0 && (hwnd_under.0 as isize) == slv_raw;
+
+                // ── Active native drag: forward to SysListView32, skip webview ──
+                if NATIVE_DRAG.load(Ordering::Relaxed) {
+                    if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
+                        NATIVE_DRAG.store(false, Ordering::Relaxed);
+                    }
+                    // Explicitly forward drag events to SysListView32.
+                    // CallNextHookEx delivers to the window under the cursor,
+                    // which may be Chrome_RWHH (not SysListView32).
+                    // SysListView32 needs WM_MOUSEMOVE to detect drag threshold
+                    // and WM_LBUTTONUP to complete the drop.
+                    if slv_raw != 0 && !hwnd_is_slv {
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                    }
+                    // Don't forward to webview during icon drag.
+                    // CallNextHookEx preserves native delivery + key state.
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // ── Diagnostic: log every LBUTTONDOWN path ──
+                if msg == WM_LBUTTONDOWN {
+                    let over = is_over_desktop(hwnd_under);
+                    let class_name = {
+                        let mut wbuf = [0u16; 64];
+                        let len = GetClassNameW(hwnd_under, &mut wbuf) as usize;
+                        if len > 0 {
+                            String::from_utf16_lossy(&wbuf[..len])
+                        } else {
+                            "?".to_string()
+                        }
+                    };
+                    log::info!(
+                        "[hook] LBUTTONDOWN pt=({},{}) hwnd_under=0x{:X} class={} is_slv={} is_over_desktop={} slv_raw=0x{:X} wv_raw=0x{:X}",
+                        info_hook.pt.x, info_hook.pt.y,
+                        hwnd_under.0 as isize, class_name, hwnd_is_slv, over,
+                        slv_raw, wv_raw,
+                    );
+                }
+
+                // ── WindowFromPoint hit SysListView32 directly ──
+                // This means the icon layer is on top of the webview at this point.
+                // For button-down: enter NATIVE_DRAG to protect subsequent MOUSEMOVE
+                // from being forwarded to the webview (which would steal mouse capture).
+                // For other messages: just pass through natively.
+                if hwnd_is_slv {
+                    if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
+                        NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        log::info!(
+                            "[hook] SysListView32 direct hit → NATIVE_DRAG, pt=({},{})",
+                            info_hook.pt.x, info_hook.pt.y,
+                        );
+                    }
+                    // Native delivery will reach SysListView32 directly via CallNextHookEx.
+                    // No webview forward, no PostMessageW needed.
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // ── Not over desktop: pass through ──
                 if !is_over_desktop(hwnd_under) {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                let msg = wparam.0 as u32;
+                // ── On desktop via webview: check if button-down is on an icon ──
+                // WindowFromPoint returned Chrome_RWHH (or WorkerW, etc.), meaning
+                // the webview is on top. Use cross-process LVM_HITTEST to check
+                // if the cursor is over a desktop icon behind the webview.
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
+                    let hit = hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt);
+                    if hit {
+                        NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        log::info!(
+                            "[hook] Icon hit (behind webview) → NATIVE_DRAG, hwnd=0x{:X}, slv=0x{:X}",
+                            hwnd_under.0 as isize,
+                            slv_raw,
+                        );
+                        // Skip webview forward. Post to SysListView32 since native
+                        // delivery goes to Chrome_RWHH (not SysListView32).
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    } else {
+                        log::info!("[hook] LBUTTONDOWN on desktop, hit_test_icon=false → wallpaper mode");
+                    }
+                }
+
+                // ── Normal desktop interaction (wallpaper) ──
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
 
-                // Forward to SysListView32 ONLY when native delivery (via
-                // CallNextHookEx) won't reach it.  When WindowFromPoint returned
-                // SysListView32, the system dispatches the event there natively,
-                // which preserves double-click, drag & drop, and context menus.
-                // When it returned Chrome_RWHH / CoreWindow / WorkerW, SysListView32
-                // would get nothing — so we PostMessageW as a fallback.
-                let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
+                // PostMessageW fallback when native delivery won't reach SysListView32
                 if (hwnd_under.0 as isize) != slv_raw && slv_raw != 0 {
-                    let slv = HWND(slv_raw as *mut _);
-                    if IsWindowVisible(slv).as_bool() {
-                        let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            ((info_hook.pt.x as i16 as u16 as u32)
-                                | ((info_hook.pt.y as i16 as u16 as u32) << 16))
-                                as isize
-                        } else {
-                            let mut slv_cp = info_hook.pt;
-                            let _ = ScreenToClient(slv, &mut slv_cp);
-                            ((slv_cp.x as i16 as u16 as u32)
-                                | ((slv_cp.y as i16 as u16 as u32) << 16))
-                                as isize
-                        };
-
-                        let mut out_msg = msg;
-                        if msg == WM_LBUTTONDOWN {
-                            // Synthesize double-click when forwarding via PostMessageW
-                            // (PostMessage bypasses native double-click detection).
-                            static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
-                                std::sync::atomic::AtomicU32::new(0);
-                            static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
-                                std::sync::atomic::AtomicI32::new(0);
-                            static LAST_DOWN_Y: std::sync::atomic::AtomicI32 =
-                                std::sync::atomic::AtomicI32::new(0);
-
-                            let now = info_hook.time;
-                            let dt = now.saturating_sub(LAST_DOWN_TIME.load(Ordering::Relaxed));
-                            let dx = (info_hook.pt.x - LAST_DOWN_X.load(Ordering::Relaxed)).abs();
-                            let dy = (info_hook.pt.y - LAST_DOWN_Y.load(Ordering::Relaxed)).abs();
-
-                            if dt > 0
-                                && dt <= DBLCLICK_TIME.load(Ordering::Relaxed)
-                                && dx <= DBLCLICK_CX.load(Ordering::Relaxed)
-                                && dy <= DBLCLICK_CY.load(Ordering::Relaxed)
-                            {
-                                out_msg = WM_LBUTTONDBLCLK;
-                                LAST_DOWN_TIME.store(0, Ordering::Relaxed);
-                            } else {
-                                LAST_DOWN_TIME.store(now, Ordering::Relaxed);
-                                LAST_DOWN_X.store(info_hook.pt.x, Ordering::Relaxed);
-                                LAST_DOWN_Y.store(info_hook.pt.y, Ordering::Relaxed);
-                            }
-                        }
-
-                        let slv_wparam = {
-                            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                            let mut mk: u16 = 0;
-                            if out_msg == WM_LBUTTONDOWN
-                                || out_msg == WM_LBUTTONDBLCLK
-                                || GetAsyncKeyState(0x01) < 0
-                            {
-                                mk |= 0x0001; // MK_LBUTTON
-                            }
-                            if out_msg == WM_RBUTTONDOWN || GetAsyncKeyState(0x02) < 0 {
-                                mk |= 0x0002; // MK_RBUTTON
-                            }
-                            if out_msg == WM_MBUTTONDOWN || GetAsyncKeyState(0x04) < 0 {
-                                mk |= 0x0010; // MK_MBUTTON
-                            }
-                            if GetAsyncKeyState(0x10) < 0 {
-                                mk |= 0x0004; // MK_SHIFT
-                            }
-                            if GetAsyncKeyState(0x11) < 0 {
-                                mk |= 0x0008; // MK_CONTROL
-                            }
-                            if out_msg == WM_MOUSEWHEEL || out_msg == WM_MOUSEHWHEEL {
-                                let delta = (info_hook.mouseData >> 16) as u16;
-                                WPARAM(((delta as usize) << 16) | mk as usize)
-                            } else {
-                                WPARAM(mk as usize)
-                            }
-                        };
-                        let _ = PostMessageW(slv, out_msg, slv_wparam, LPARAM(lp));
-                    }
+                    post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                 }
 
                 CallNextHookEx(hook_h, code, wparam, lparam)
