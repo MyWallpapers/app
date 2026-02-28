@@ -722,10 +722,9 @@ pub mod mouse_hook {
                 DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
 
                 // Register for session lock/unlock notifications
-                use windows::Win32::System::RemoteDesktop::{
-                    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
-                };
-                let _ = WTSRegisterSessionNotification(h, NOTIFY_FOR_THIS_SESSION.0 as u32);
+                use windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
+                // NOTIFY_FOR_THIS_SESSION = 0x0
+                let _ = WTSRegisterSessionNotification(h, 0);
             }
         }
     }
