@@ -969,10 +969,16 @@ pub mod mouse_hook {
         let _ = CloseHandle(proc);
 
         log::info!(
-            "[hit_test] screen=({},{}) client=({},{}) send_ok={} msg_result={} read_ok={} i_item={} flags=0x{:X}",
-            screen_pt.x, screen_pt.y, pt.x, pt.y,
-            send_ok.is_ok(), msg_result, read_ok.is_ok(),
-            ht_out.i_item, ht_out.flags,
+            "[hit_test] screen=({},{}) client=({},{}) send_ret={} msg_result={} read_ok={} i_item={} flags=0x{:X}",
+            screen_pt.x,
+            screen_pt.y,
+            pt.x,
+            pt.y,
+            send_ok.0,
+            msg_result,
+            read_ok.is_ok(),
+            ht_out.i_item,
+            ht_out.flags,
         );
 
         ht_out.i_item >= 0

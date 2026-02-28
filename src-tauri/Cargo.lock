@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.232"
+version = "1.0.234"
 dependencies = [
  "battery",
  "discord-rich-presence",
