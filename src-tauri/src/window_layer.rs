@@ -1140,6 +1140,10 @@ pub mod mouse_hook {
             /// GetKeyState(VK_LBUTTON) on explorer's thread returns "pressed"
             /// even though the hardware WM_LBUTTONDOWN was delivered to Chrome_RWHH.
             unsafe fn set_thread_attach(slv_raw: isize, attach: bool) {
+                extern "system" {
+                    fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
+                }
+
                 let rwhh_raw = CHROME_RWHH.load(Ordering::Relaxed);
                 if rwhh_raw == 0 || slv_raw == 0 {
                     return;
@@ -1147,7 +1151,7 @@ pub mod mouse_hook {
                 let chrome_tid = GetWindowThreadProcessId(HWND(rwhh_raw as *mut _), None);
                 let explorer_tid = GetWindowThreadProcessId(HWND(slv_raw as *mut _), None);
                 if chrome_tid != 0 && explorer_tid != 0 && chrome_tid != explorer_tid {
-                    let _ = AttachThreadInput(chrome_tid, explorer_tid, attach);
+                    AttachThreadInput(chrome_tid, explorer_tid, i32::from(attach));
                     THREADS_ATTACHED.store(attach, Ordering::Relaxed);
                     log::info!(
                         "[hook] AttachThreadInput({}, {}, {}) → shared key state",
