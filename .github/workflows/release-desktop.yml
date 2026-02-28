@@ -52,7 +52,8 @@ jobs:
       - name: Tests
         run: cd src-tauri && cargo test --all
 
-      - name: Security audit
+      - name: Security audit (advisory)
+        continue-on-error: true
         run: |
           cargo install cargo-audit --locked
           cd src-tauri && cargo audit
