@@ -625,7 +625,8 @@ pub mod mouse_hook {
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static INJECTING_FOR_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static INJECTING_FOR_DRAG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     #[allow(dead_code)]
     static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1208,25 +1209,32 @@ pub mod mouse_hook {
                     INJECTING_FOR_DRAG.store(true, Ordering::Relaxed);
                     unsafe {
                         use windows::Win32::UI::Input::KeyboardAndMouse::{
-                            SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_MOVE,
-                            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                            SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
+                            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
                             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
                         };
                         // Convert screen coords to normalized absolute (0..65535)
                         let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) as f64;
+                            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+                        ) as f64;
                         let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) as f64;
+                            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+                        ) as f64;
                         let nx = ((info_hook.pt.x as f64 + 0.5) * 65536.0 / screen_w) as i32;
                         let ny = ((info_hook.pt.y as f64 + 0.5) * 65536.0 / screen_h) as i32;
 
-                        let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | match msg {
-                            WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
-                            WM_LBUTTONUP   => MOUSEEVENTF_LEFTUP,
-                            WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
-                            WM_RBUTTONUP   => MOUSEEVENTF_RIGHTUP,
-                            _ => windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS(0),
-                        };
+                        let flags =
+                            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | match msg {
+                                WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
+                                WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
+                                WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
+                                WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
+                                _ => {
+                                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS(
+                                        0,
+                                    )
+                                }
+                            };
                         let mut input = INPUT {
                             r#type: INPUT_MOUSE,
                             ..Default::default()
