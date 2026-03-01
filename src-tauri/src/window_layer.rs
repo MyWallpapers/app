@@ -625,6 +625,7 @@ pub mod mouse_hook {
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static INJECTING_FOR_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[allow(dead_code)]
     static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1188,33 +1189,56 @@ pub mod mouse_hook {
 
                 // ── Active native drag: forward to SysListView32, skip webview ──
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
+                    // If this event was injected by us via SendInput, let it pass through
+                    // to the real input stream (SysListView32 will receive it naturally).
+                    if INJECTING_FOR_DRAG.load(Ordering::Relaxed) {
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    }
+
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
                     }
 
-                    // CRITICAL FIX: When WH_MOUSE_LL returns LRESULT(1), the OS does NOT
-                    // update the real cursor position. SysListView32's DragDetect() calls
-                    // GetCursorPos() internally — if cursor position never changes,
-                    // DragDetect() sees no movement and never triggers the drag.
-                    // Fix: manually call SetCursorPos() on WM_MOUSEMOVE during drag
-                    // so the OS cursor position matches the actual mouse movement.
-                    if msg == WM_MOUSEMOVE {
-                        use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
-                        let _ = SetCursorPos(info_hook.pt.x, info_hook.pt.y);
-                    }
+                    // CRITICAL FIX: PostMessageW doesn't update the real cursor position,
+                    // so DragDetect() (which calls GetCursorPos internally) sees no movement.
+                    // Fix: use SendInput() to re-inject mouse events into the real input
+                    // stream. The INJECTING_FOR_DRAG flag prevents re-entrant hook firing.
+                    // The re-injected event bypasses our hook (INJECTING=true) and flows
+                    // naturally to SysListView32 so DragDetect() and DoDragDrop() work.
+                    INJECTING_FOR_DRAG.store(true, Ordering::Relaxed);
+                    unsafe {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{
+                            SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_MOVE,
+                            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+                        };
+                        // Convert screen coords to normalized absolute (0..65535)
+                        let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) as f64;
+                        let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) as f64;
+                        let nx = ((info_hook.pt.x as f64 + 0.5) * 65536.0 / screen_w) as i32;
+                        let ny = ((info_hook.pt.y as f64 + 0.5) * 65536.0 / screen_h) as i32;
 
-                    // Post ALL events to SysListView32 (down/move/up)
-                    // so it receives the complete drag gesture.
-                    if slv_raw != 0 {
-                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                        let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | match msg {
+                            WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
+                            WM_LBUTTONUP   => MOUSEEVENTF_LEFTUP,
+                            WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
+                            WM_RBUTTONUP   => MOUSEEVENTF_RIGHTUP,
+                            _ => windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS(0),
+                        };
+                        let mut input = INPUT {
+                            r#type: INPUT_MOUSE,
+                            ..Default::default()
+                        };
+                        input.Anonymous.mi.dx = nx;
+                        input.Anonymous.mi.dy = ny;
+                        input.Anonymous.mi.dwFlags = flags;
+                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
                     }
-                    // Consume ALL events: Chrome_RWHH must not receive ANY mouse
-                    // input during icon drag. If Chrome gets even WM_LBUTTONDOWN
-                    // via CallNextHookEx, it calls SetCapture + SetFocus, which
-                    // fights with SysListView32's own capture/focus and prevents
-                    // drag detection. By consuming everything (LRESULT(1)),
-                    // Chrome is completely blind and SysListView32 handles the
-                    // entire gesture via PostMessageW above.
+                    INJECTING_FOR_DRAG.store(false, Ordering::Relaxed);
+
+                    // Consume the original event so Chrome doesn't interfere.
                     return LRESULT(1);
                 }
 
