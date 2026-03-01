@@ -1191,6 +1191,18 @@ pub mod mouse_hook {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
                     }
+
+                    // CRITICAL FIX: When WH_MOUSE_LL returns LRESULT(1), the OS does NOT
+                    // update the real cursor position. SysListView32's DragDetect() calls
+                    // GetCursorPos() internally — if cursor position never changes,
+                    // DragDetect() sees no movement and never triggers the drag.
+                    // Fix: manually call SetCursorPos() on WM_MOUSEMOVE during drag
+                    // so the OS cursor position matches the actual mouse movement.
+                    if msg == WM_MOUSEMOVE {
+                        use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+                        let _ = SetCursorPos(info_hook.pt.x, info_hook.pt.y);
+                    }
+
                     // Post ALL events to SysListView32 (down/move/up)
                     // so it receives the complete drag gesture.
                     if slv_raw != 0 {
