@@ -70,7 +70,7 @@ The workflow automatically:
 
 The app checks for updates from this repo's releases. Updater artifacts are signed with a minisign keypair. The public key is in `tauri.conf.json`, the private key is stored as a GitHub Actions secret (`TAURI_SIGNING_PRIVATE_KEY`).
 
-Endpoint: `https://github.com/MyWallpapers/app/releases/latest/download/latest.json`
+Endpoint: `https://github.com/MyWallpapers/client/releases/latest/download/latest.json`
 
 ## Development
 

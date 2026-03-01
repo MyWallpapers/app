@@ -85,7 +85,7 @@ Exposes system data to widgets via Tauri IPC:
 
 ### Auto-Updater
 
-- Endpoint: `https://github.com/MyWallpapers/app/releases/latest/download/latest.json`
+- Endpoint: `https://github.com/MyWallpapers/client/releases/latest/download/latest.json`
 - Public key in `tauri.conf.json`, private key in GitHub Actions secrets
 - Frontend can override endpoint for pre-release channel
 

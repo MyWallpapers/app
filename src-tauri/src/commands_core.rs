@@ -63,7 +63,7 @@ pub fn validate_system_categories(categories: &[String]) -> Vec<String> {
 // ============================================================================
 
 const ALLOWED_UPDATER_HOST: &str = "github.com";
-const ALLOWED_UPDATER_PATH_PREFIX: &str = "/MyWallpapers/app/releases/download/";
+const ALLOWED_UPDATER_PATH_PREFIX: &str = "/MyWallpapers/client/releases/download/";
 
 /// Validate that an updater endpoint URL points to our GitHub releases.
 pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), AppError> {
@@ -79,7 +79,7 @@ pub fn validate_updater_endpoint(endpoint: &str) -> Result<(), AppError> {
     }
     if !parsed.path().starts_with(ALLOWED_UPDATER_PATH_PREFIX) {
         return Err(AppError::Validation(
-            "Endpoint must point to MyWallpapers/app releases".into(),
+            "Endpoint must point to MyWallpapers/client releases".into(),
         ));
     }
     Ok(())
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn test_valid_updater_endpoint() {
         assert!(validate_updater_endpoint(
-            "https://github.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
+            "https://github.com/MyWallpapers/client/releases/download/v1.0.0/latest.json"
         )
         .is_ok());
     }
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn test_valid_updater_endpoint_dev_tag() {
         assert!(validate_updater_endpoint(
-            "https://github.com/MyWallpapers/app/releases/download/v1.0.0-dev/latest.json"
+            "https://github.com/MyWallpapers/client/releases/download/v1.0.0-dev/latest.json"
         )
         .is_ok());
     }
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_updater_rejects_http() {
         assert!(validate_updater_endpoint(
-            "http://github.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
+            "http://github.com/MyWallpapers/client/releases/download/v1.0.0/latest.json"
         )
         .is_err());
     }
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_updater_rejects_wrong_host() {
         assert!(validate_updater_endpoint(
-            "https://evil.com/MyWallpapers/app/releases/download/v1.0.0/latest.json"
+            "https://evil.com/MyWallpapers/client/releases/download/v1.0.0/latest.json"
         )
         .is_err());
     }
